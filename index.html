@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>越寮觀察 — 越南・寮國每日新聞摘要</title>
+<meta name="description" content="每日自動彙整越南與寮國政治、經濟、社會新聞標題，並附原文連結。">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-top">
+    <h1 class="site-title">
+      越寮觀察
+      <span class="subtitle">VIETNAM &amp; LAOS DAILY DIGEST</span>
+    </h1>
+    <button id="theme-toggle" type="button" aria-label="切換深色／淺色模式">◐</button>
+  </div>
+
+  <div class="control-bar">
+    <div class="date-seal">
+      <span class="seal-icon" aria-hidden="true">日</span>
+      <label for="date-input" class="sr-only">選擇日期</label>
+      <input type="date" id="date-input">
+    </div>
+    <div class="updated-info" id="updated-text">資料最後更新：讀取中…</div>
+  </div>
+</header>
+
+<main>
+  <div class="loading-state" id="loading">摘要載入中…</div>
+  <div class="empty-state" id="empty" hidden>當日無符合條件之新聞。</div>
+
+  <div class="sections-grid" id="sections" hidden>
+    <section class="category-column" data-category="01">
+      <h2 class="category-header cat-political"><span class="cat-badge">01</span>政治</h2>
+      <ul class="news-list" id="list-01"></ul>
+    </section>
+
+    <section class="category-column" data-category="02">
+      <h2 class="category-header cat-economic"><span class="cat-badge">02</span>經濟</h2>
+      <ul class="news-list" id="list-02"></ul>
+    </section>
+
+    <section class="category-column" data-category="03">
+      <h2 class="category-header cat-other"><span class="cat-badge">03</span>其他</h2>
+      <ul class="news-list" id="list-03"></ul>
+    </section>
+  </div>
+</main>
+
+<footer>
+  資料每日自動更新，內容由 AI 輔助翻譯與分類，僅供參考，正確內容請以原文連結為準。
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>

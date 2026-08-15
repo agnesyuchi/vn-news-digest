@@ -1,48 +1,9 @@
 {
   "date": "2026-08-15",
-  "generated_at": "2026-08-15T07:03:12+07:00",
+  "generated_at": "2026-08-15T13:12:46.495638+07:00",
   "categories": {
-    "01": [
-      {
-        "title": "越南國家主席蘇林啟程訪問寮國，強化雙邊全面戰略夥伴關係",
-        "link": "https://example.com/vn-politics-1",
-        "source": "VietnamPlus 中文網",
-        "published": "2026-08-14T09:30:00+07:00"
-      },
-      {
-        "title": "越南國會通過人事調整案，多名地方黨委書記異動",
-        "link": "https://example.com/vn-politics-2",
-        "source": "越南投資 (yuenan.com)",
-        "published": "2026-08-14T14:12:00+07:00"
-      }
-    ],
-    "02": [
-      {
-        "title": "越南上半年出口總額創新高，電子產品貢獻逾三成",
-        "link": "https://example.com/vn-economy-1",
-        "source": "Google News - 越南",
-        "published": "2026-08-14T11:00:00+07:00"
-      },
-      {
-        "title": "台商半導體大廠宣布擴大在北寧省投資規模",
-        "link": "https://example.com/vn-economy-2",
-        "source": "越南投資 (yuenan.com)",
-        "published": "2026-08-14T16:45:00+07:00"
-      }
-    ],
-    "03": [
-      {
-        "title": "越南胡志明市推出外籍人士簽證新規定，8月起生效",
-        "link": "https://example.com/vn-other-1",
-        "source": "中央通訊社 (CNA) - 越南",
-        "published": "2026-08-14T10:20:00+07:00"
-      },
-      {
-        "title": "寮國警方破獲跨國詐騙集團，多名台籍受害者獲救",
-        "link": "https://example.com/laos-other-1",
-        "source": "中央通訊社 (CNA) - 寮國",
-        "published": "2026-08-14T18:05:00+07:00"
-      }
-    ]
+    "01": [],
+    "02": [],
+    "03": []
   }
 }

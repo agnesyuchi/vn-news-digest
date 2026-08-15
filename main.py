@@ -39,7 +39,10 @@ from bs4 import BeautifulSoup
 
 VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")  # UTC+7，寮國與越南同時區
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-GEMINI_MODEL = "gemini-3.5-flash"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+# 選用 flash-lite 而非一般 flash：這是 Google 官方定位為「高流量、低延遲的翻譯／
+# 分類／資料萃取」任務的輕量模型，完全符合本專案的使用情境，且免費額度遠高於
+# 一般 flash 模型（一般 flash 近期免費額度被大幅緊縮，部分帳戶每日僅 20 次請求）。
 # 註：Gemini 模型名稱會隨時間淘汰／更新（例如 gemini-1.5-flash 已於 2025 年停用）。
 # 若之後執行時又出現「404 NOT_FOUND ... is not found for API version」，
 # 表示這裡設定的模型名稱已被 Google 淘汰，請至 https://ai.google.dev/gemini-api/docs/models
@@ -420,6 +423,22 @@ def try_parse_time(text):
     return None
 
 
+def _apply_yuenan_published_time(item, html_content):
+    """從文章內頁 HTML 中解析精確發布時間，成功則寫入 item['published']。"""
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+        time_el = soup.select_one("time.entry-date.published") or soup.select_one("time.published")
+        if time_el:
+            dt_str = time_el.get("datetime")
+            if dt_str:
+                dt = datetime.fromisoformat(dt_str)
+                item["published"] = dt.astimezone(VN_TZ)
+                return True
+    except Exception as e:
+        print(f"[WARN] 解析文章內頁時間失敗 ({item['link']}): {e}", file=sys.stderr)
+    return False
+
+
 def enrich_yuenan_published_times(items):
     """針對任何連結指向 yuenan.com、但目前抓不到精確發布時間的項目，
     進一步造訪該篇文章的內頁，讀取標準格式的發布時間標籤：
@@ -427,29 +446,65 @@ def enrich_yuenan_published_times(items):
     這個時間戳精確到秒且含時區，比列表頁「2小时前」這類相對時間可靠許多，
     可用來補強／取代原本解析失敗或不精確的時間。
     此函式會直接修改傳入 items 中符合條件項目的 "published" 欄位。
+
+    效能考量：先用較快的 requests / curl_cffi 嘗試每篇文章；只有這兩種方式
+    都失敗的文章，才集中改用「同一個」Playwright 瀏覽器實例依序處理
+    （而非每篇文章各自啟動一次瀏覽器），因為啟動瀏覽器的成本遠高於單純換頁。
     """
     targets = [it for it in items if "yuenan.com" in it["link"] and it.get("published") is None]
     if not targets:
         return
 
     print(f"[INFO] 針對 {len(targets)} 筆 yuenan.com 文章嘗試從文章內頁取得精確發布時間", file=sys.stderr)
+
     success_count = 0
+    needs_playwright = []
+
     for it in targets:
-        html_content, _method = _fetch_page_html(it["link"])
-        if html_content is None:
-            continue
+        html_content = None
         try:
-            soup = BeautifulSoup(html_content, "html.parser")
-            time_el = soup.select_one("time.entry-date.published") or soup.select_one("time.published")
-            if time_el:
-                dt_str = time_el.get("datetime")
-                if dt_str:
-                    dt = datetime.fromisoformat(dt_str)
-                    it["published"] = dt.astimezone(VN_TZ)
-                    success_count += 1
+            resp = requests.get(it["link"], headers=HEADERS, timeout=15)
+            if resp.status_code == 200:
+                html_content = resp.text
+        except Exception:
+            pass
+
+        if html_content is None:
+            try:
+                from curl_cffi import requests as curl_requests
+                resp = curl_requests.get(it["link"], headers=HEADERS, impersonate="chrome124", timeout=20)
+                if resp.status_code == 200:
+                    html_content = resp.text
+            except Exception:
+                pass
+
+        if html_content is not None:
+            if _apply_yuenan_published_time(it, html_content):
+                success_count += 1
+        else:
+            needs_playwright.append(it)
+        time.sleep(0.5)
+
+    if needs_playwright:
+        print(
+            f"[INFO] {len(needs_playwright)} 篇文章需改用 Playwright（將共用同一瀏覽器實例依序處理）",
+            file=sys.stderr,
+        )
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page(user_agent=HEADERS["User-Agent"])
+                for it in needs_playwright:
+                    try:
+                        page.goto(it["link"], timeout=30000, wait_until="networkidle")
+                        if _apply_yuenan_published_time(it, page.content()):
+                            success_count += 1
+                    except Exception as e:
+                        print(f"[WARN] Playwright 抓取文章內頁失敗 ({it['link']}): {e}", file=sys.stderr)
+                browser.close()
         except Exception as e:
-            print(f"[WARN] 解析文章內頁時間失敗 ({it['link']}): {e}", file=sys.stderr)
-        time.sleep(1)  # 禮貌性間隔
+            print(f"[WARN] Playwright 初始化失敗，剩餘文章無法補齊精確時間: {e}", file=sys.stderr)
 
     print(f"[INFO] 成功補齊 {success_count}/{len(targets)} 筆 yuenan.com 精確發布時間", file=sys.stderr)
 
@@ -536,76 +591,63 @@ def _clean_json_block(text):
     return re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
 
 
-def build_dedupe_prompt(items):
-    numbered = "\n".join(
-        f'{i+1}. 「{it["title"]}」（來源：{it["source"]}）'
-        for i, it in enumerate(items)
-    )
-    return f"""以下是今天蒐集到的越南／寮國相關新聞標題清單，其中可能包含多篇「描述同一則新聞事件」
-的重複報導（例如同一則消息被不同媒體轉載、或用不同標題描述同一件事）。
-
-請找出所有屬於同一事件的重複項目，將它們的編號分組。判斷標準是「新聞事件本身是否相同」，
-而非文字是否完全一樣（例如標題用詞不同、詳略不同，但描述同一事件，仍算重複）。
-不確定是否重複時，請不要分在同一組（寧可漏判，不要誤判）。
-
-新聞清單：
-{numbered}
-
-請「只」回傳一個 JSON 物件，不要加入任何說明文字或 Markdown 語法，格式如下：
-{{"duplicate_groups": [[編號, 編號, ...], [編號, 編號, ...]]}}
-只需列出「有重複」的分組（每組至少 2 個編號），沒有重複的項目不必列出。
-若完全沒有重複項目，回傳 {{"duplicate_groups": []}}。
-"""
-
-
-def semantic_dedupe(items, api_key):
-    """用 Gemini 對整批新聞做語意去重，回傳去重後的清單。
-    若 API 呼叫失敗，為避免整批資料流失，退回直接使用網址去重的結果。
+def _call_gemini_with_retry(prompt, api_key, max_retries=3):
+    """呼叫 Gemini API，遇到暫時性錯誤（429 速率限制、503 服務忙碌）時，
+    依錯誤訊息中建議的等待秒數（或預設遞增秒數）自動重試，
+    降低因短暫流量尖峰而整批資料流失的機率。
+    注意：若是「當日額度已用完」（RESOURCE_EXHAUSTED 且無法在短時間恢復），
+    重試無法解決問題，仍會在重試次數用盡後回傳 None。
     """
-    if len(items) <= 1:
-        return items
-
     from google import genai
+
     client = genai.Client(api_key=api_key)
-    prompt = build_dedupe_prompt(items)
 
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        parsed = json.loads(_clean_json_block(response.text))
-        groups = parsed.get("duplicate_groups", [])
-    except Exception as e:
-        print(f"[WARN] 語意去重呼叫或解析失敗，本次略過語意去重: {e}", file=sys.stderr)
-        return items
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+            return response.text
+        except Exception as e:
+            err_text = str(e)
+            is_rate_limit = "429" in err_text or "RESOURCE_EXHAUSTED" in err_text
+            is_transient = "503" in err_text or "UNAVAILABLE" in err_text
 
-    to_remove = set()
-    for group in groups:
-        valid_indices = sorted({i - 1 for i in group if isinstance(i, int) and 1 <= i <= len(items)})
-        if len(valid_indices) < 2:
-            continue
-        # 保留規則：優先保留「非 Google News 轉載」的原始出處；
-        # 若組內都是轉載或都非轉載，則保留清單中最先出現的一筆。
-        keep_idx = None
-        for idx in valid_indices:
-            if "Google News 轉載" not in items[idx]["source"]:
-                keep_idx = idx
-                break
-        if keep_idx is None:
-            keep_idx = valid_indices[0]
-        for idx in valid_indices:
-            if idx != keep_idx:
-                to_remove.add(idx)
+            if attempt == max_retries or not (is_rate_limit or is_transient):
+                print(f"[ERROR] Gemini API 呼叫失敗（第 {attempt} 次嘗試）: {e}", file=sys.stderr)
+                return None
 
-    deduped = [item for i, item in enumerate(items) if i not in to_remove]
-    print(f"[INFO] 語意去重：{len(items)} 筆 → {len(deduped)} 筆（移除 {len(to_remove)} 筆重複報導）")
-    return deduped
+            # 嘗試從錯誤訊息中解析 Google 建議的等待秒數（retryDelay），找不到則用遞增預設值
+            wait_seconds = 10 * attempt
+            m = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+)", err_text)
+            if m:
+                wait_seconds = int(m.group(1)) + 2  # 額外加 2 秒緩衝
+
+            print(
+                f"[WARN] Gemini API 暫時性錯誤（第 {attempt}/{max_retries} 次嘗試），"
+                f"{wait_seconds} 秒後重試: {e}",
+                file=sys.stderr,
+            )
+            time.sleep(wait_seconds)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Gemini API：批次翻譯 + 分類
+# Gemini API：去重 + 翻譯 + 分類（合併為單一次呼叫，降低每日請求次數）
 # ---------------------------------------------------------------------------
+#
+# 先前版本將「語意去重」與「翻譯＋分類」拆成兩階段、且分類階段又依 15 筆一批
+# 分批呼叫，單次執行合計可能耗用 8 次以上的 API 請求。Gemini 的上下文視窗
+# 大到可以一次容納數百則新聞標題，因此改為「單一 prompt、單一次呼叫」
+# 同時完成去重、翻譯、分類三件事，將每日請求次數大幅降低，
+# 也避免分類規則文字被重複傳送多次而浪費 token。
+#
+# 為避免單日新聞量異常龐大時單一請求過大，仍保留 DEDUPE_CLASSIFY_BATCH_SIZE
+# 作為安全上限；超過此上限才會切成多個批次（正常情況下應恆為 1 次請求）。
+
+DEDUPE_CLASSIFY_BATCH_SIZE = 300
 
 CATEGORY_RULES = """
 判斷角度：請以「台灣、越南、寮國外交部門」會關注的事項為標準，而非單純規模大小。
@@ -663,19 +705,26 @@ CATEGORY_RULES = """
 """
 
 
-def build_classify_prompt(batch):
+def build_combined_prompt(items):
     numbered = "\n".join(
-        f'{i+1}. 標題原文：「{it["title"]}」（來源：{it["source"]}）'
-        for i, it in enumerate(batch)
+        f'{i+1}. 「{it["title"]}」（來源：{it["source"]}）'
+        for i, it in enumerate(items)
     )
-    return f"""你是一位外交部新聞資訊編輯，任務是從蒐集到的新聞中，篩選出「對台灣、越南、
-寮國外交部門具有參考價值」的新聞——包括外交互動、經貿政策、供應鏈地緣政治、
-領事僑務保護等面向，而不是只挑選規模最大的頭條。請針對以下每一則新聞，完成兩件事：
+    return f"""你是一位外交部新聞資訊編輯，請對以下新聞清單依序完成三項任務：
 
-(a) 將標題翻譯／轉寫為「繁體中文」，語氣維持新聞標題的簡潔客觀風格；
-(b) 依照下列分類規則判斷這則新聞屬於 "01"（政治）、"02"（經濟）、
-    "03"（其他）中的哪一類。若屬於純地方生活瑣事、與外交／經貿／
-    領事事務無明顯關聯，才歸類為 "discard"。
+【任務一：去重】找出所有屬於「同一新聞事件」的重複報導（例如同一則消息被不同媒體轉載、
+或用不同標題描述同一件事），每組只保留一則代表性項目（優先保留非「Google News 轉載」
+的原始出處；若整組都是或都不是轉載，保留編號最小的一則）。不確定是否重複時，
+不要視為重複（寧可漏判，不要誤判）。
+
+【任務二：翻譯】針對「保留下來」的每一則新聞，將標題翻譯／轉寫為繁體中文，
+語氣維持新聞標題的簡潔客觀風格。
+
+【任務三：分類】任務是從中篩選出「對台灣、越南、寮國外交部門具有參考價值」的新聞——
+包括外交互動、經貿政策、供應鏈地緣政治、領事僑務保護等面向，而不是只挑選規模最大的頭條。
+依照下列分類規則，將每則「保留下來」的新聞歸類為 "01"（政治）、"02"（經濟）、
+"03"（其他）其中之一。若屬於純地方生活瑣事、與外交／經貿／領事事務無明顯關聯，
+歸類為 "discard"。
 
 分類規則：
 {CATEGORY_RULES}
@@ -684,58 +733,57 @@ def build_classify_prompt(batch):
 {numbered}
 
 請「只」回傳一個 JSON 陣列，不要加入任何說明文字或 Markdown 語法（不要用 ```json 包裹）。
-陣列中每個元素格式為：
-{{"index": 原始編號(數字), "title_zh": "翻譯後的繁體中文標題", "category": "01/02/03/discard"}}
-陣列順序需與輸入清單一致，且每則輸入都必須有對應輸出。
+陣列只需包含「去重後保留、且分類不為 discard」的項目，格式為：
+{{"index": 原始編號(數字), "title_zh": "翻譯後的繁體中文標題", "category": "01/02/03"}}
 """
 
 
-def call_gemini_classify_batch(batch, api_key):
-    """呼叫 Gemini API 進行批次翻譯與分類，回傳 dict: index -> {title_zh, category}"""
-    from google import genai
+def dedupe_translate_classify(items, api_key):
+    """單一 Gemini 呼叫同時完成：語意去重、標題翻譯、分類。
+    回傳最終應寫入摘要檔的新聞清單。
+    """
+    if not items:
+        return []
 
-    client = genai.Client(api_key=api_key)
-    prompt = build_classify_prompt(batch)
-
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        parsed = json.loads(_clean_json_block(response.text))
-        result = {}
-        for entry in parsed:
-            idx = int(entry["index"]) - 1
-            result[idx] = {
-                "title_zh": entry.get("title_zh", "").strip(),
-                "category": entry.get("category", "discard").strip(),
-            }
-        return result
-    except Exception as e:
-        print(f"[ERROR] Gemini 分類 API 呼叫或解析失敗: {e}", file=sys.stderr)
-        return {}
-
-
-def classify_and_translate(items, api_key, batch_size=15):
-    """將 items 分批送入 Gemini，回傳篩選/翻譯/分類後的新聞清單。"""
     output = []
-    for i in range(0, len(items), batch_size):
-        batch = items[i:i + batch_size]
-        results = call_gemini_classify_batch(batch, api_key)
-        for local_idx, item in enumerate(batch):
-            info = results.get(local_idx)
-            if not info or info["category"] == "discard":
+    for i in range(0, len(items), DEDUPE_CLASSIFY_BATCH_SIZE):
+        batch = items[i:i + DEDUPE_CLASSIFY_BATCH_SIZE]
+        prompt = build_combined_prompt(batch)
+        raw_text = _call_gemini_with_retry(prompt, api_key)
+
+        if raw_text is None:
+            print(
+                f"[ERROR] 本批 {len(batch)} 筆新聞因 Gemini API 呼叫失敗而略過"
+                f"（常見原因：當日免費額度已用完，需等待額度重置或升級付費方案）。",
+                file=sys.stderr,
+            )
+            continue
+
+        try:
+            parsed = json.loads(_clean_json_block(raw_text))
+        except Exception as e:
+            print(f"[ERROR] Gemini 回傳內容解析失敗: {e}", file=sys.stderr)
+            continue
+
+        for entry in parsed:
+            try:
+                idx = int(entry["index"]) - 1
+            except (KeyError, ValueError, TypeError):
                 continue
-            if info["category"] not in ("01", "02", "03"):
+            if not (0 <= idx < len(batch)):
                 continue
+            category = entry.get("category", "").strip()
+            if category not in ("01", "02", "03"):
+                continue
+            item = batch[idx]
             output.append({
-                "title": info["title_zh"] or item["title"],
+                "title": entry.get("title_zh", "").strip() or item["title"],
                 "link": item["link"],
                 "source": item["source"],
-                "category": info["category"],
+                "category": category,
                 "published": item["published"].isoformat() if item.get("published") else None,
             })
-        time.sleep(1)  # 批次間稍作停頓，降低 API 速率限制風險
+
     return output
 
 
@@ -826,10 +874,8 @@ def main():
     if not url_deduped:
         print("[INFO] 本次無符合時間區間之新聞，仍會輸出空白摘要檔以維持前端日期可查。")
 
-    semantically_deduped = semantic_dedupe(url_deduped, api_key)
-
-    classified = classify_and_translate(semantically_deduped, api_key)
-    print(f"[INFO] Gemini 分類後保留筆數: {len(classified)}")
+    classified = dedupe_translate_classify(url_deduped, api_key)
+    print(f"[INFO] Gemini 去重＋分類後保留筆數: {len(classified)}")
 
     write_daily_json(target_date, classified, now_vn)
     update_index(target_date)

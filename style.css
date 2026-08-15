@@ -1,8 +1,8 @@
 /* ============================================================
    越寮觀察 — 每日新聞摘要
-   設計主題：霜色與夜港 — 深藍炭灰夜色 + 銅金點綴 + 冰霜淺藍晨光
-   淺色/深色模式共享同一組炭灰／冰藍錨點色，銅金作為兩種模式下
-   共通的畫龍點睛元素。
+   設計主題：夜港與鉑金 — 深藍炭灰夜色 + 銅金點綴 + 鉑金灰晨光
+   深色模式背景炭灰，反過來成為淺色模式的文字色，兩種模式互為表裡；
+   銅金作為兩種模式下共通的畫龍點睛元素。
    ============================================================ */
 
 @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@500;700&family=Noto+Sans+TC:wght@400;500;600&display=swap');
@@ -35,12 +35,12 @@
 }
 
 html[data-theme="light"] {
-  --bg-page: #EBFAFF;
+  --bg-page: #E5E4E2;
   --bg-raised: #FFFFFF;
   --text-primary: #36454F;
-  --text-secondary: #5C707A;
-  --border-hairline: rgba(54, 69, 79, 0.14);
-  --color-brass: #A9822F;
+  --text-secondary: #4A5860;
+  --border-hairline: rgba(54, 69, 79, 0.16);
+  --color-brass: #7C6023;
   --color-brass-dim: #6E5522;
   --color-vermilion: #A63A2E;
   --color-jade: #3F7D6B;

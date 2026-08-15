@@ -75,10 +75,13 @@ SOURCES = [
         "name": "越南投資 (yuenan.com)",
         "type": "html",
         "list_url": "https://yuenan.com/news/",
-        # 此來源改用專屬解析邏輯（見 parse_yuenan_listing），
+        # 此來源改用專屬解析邏輯（見 parse_yuenan_listing / fetch_yuenan_paginated），
         # 因為 item-title 與 item-meta 是「兄弟節點」而非巢狀結構，
         # 不適合套用下方通用的 item_selector/title_selector 模式。
         "parser": "yuenan",
+        # 最多翻頁頁數上限，避免新聞量異常多的日子無止盡翻頁；
+        # 實際會翻幾頁取決於何時遇到超出 24 小時範圍的文章。
+        "max_pages": 5,
     },
     {
         "name": "VietnamPlus 中文網",
@@ -361,6 +364,70 @@ def parse_yuenan_listing(html, base_url, source_name):
     return items, soup
 
 
+def fetch_yuenan_paginated(source):
+    """越南投資 (yuenan.com) 專用：自動翻頁抓取，直到遇到超出 24 小時範圍的
+    文章為止（或達到 max_pages 上限）。
+
+    停止邏輯：新聞列表通常依時間新到舊排列，因此只要「當前頁面的所有文章」
+    都還在 24 小時候選範圍內，就繼續翻下一頁；一旦某一頁出現任何一篇
+    超出範圍的文章，代表已經翻越當日範圍的邊界，後面的頁面只會更舊，
+    此時就停止翻頁（但仍保留這一頁已解析到的項目，讓後續時間篩選處理）。
+
+    分頁網址格式採用 WordPress 常見的 /page/N/ 慣例（依網站原始碼中的
+    schema.org、hentry、wp-content 等標記判斷應為 WordPress 站台）。
+    若實際分頁網址格式不同，第 2 頁會抓取失敗或解析到 0 筆，
+    log 中會印出對應的除錯訊息協助調整。
+    """
+    max_pages = source.get("max_pages", 5)
+    all_items = []
+
+    for page_num in range(1, max_pages + 1):
+        if page_num == 1:
+            page_url = source["list_url"]
+        else:
+            page_url = source["list_url"].rstrip("/") + f"/page/{page_num}/"
+
+        html_content, method_used = _fetch_page_html(page_url)
+        if html_content is None:
+            print(
+                f"[INFO] {source['name']} 第 {page_num} 頁無法取得（可能已無更多分頁），停止翻頁",
+                file=sys.stderr,
+            )
+            break
+
+        print(f"[INFO] {source['name']} 第 {page_num} 頁以「{method_used}」方式成功取得頁面", file=sys.stderr)
+
+        page_items, soup = parse_yuenan_listing(html_content, page_url, source["name"])
+
+        if not page_items:
+            print(f"[INFO] {source['name']} 第 {page_num} 頁解析到 0 筆新聞", file=sys.stderr)
+            if page_num == 1:
+                # 第一頁就抓不到任何項目，代表版面結構可能已變動，印出除錯資訊。
+                _debug_dump_html_snippet(source["name"], soup)
+            break
+
+        all_items.extend(page_items)
+
+        all_within_24h = all(it.get("_within_24h_candidate", True) for it in page_items)
+        if not all_within_24h:
+            print(
+                f"[INFO] {source['name']} 第 {page_num} 頁已出現超出 24 小時範圍的文章，停止翻頁",
+                file=sys.stderr,
+            )
+            break
+
+        if page_num == max_pages:
+            print(
+                f"[INFO] {source['name']} 已達最大翻頁上限（{max_pages} 頁），停止翻頁"
+                f"（如常態性需要更多頁，可調高 SOURCES 設定中的 max_pages）",
+                file=sys.stderr,
+            )
+
+        time.sleep(1)  # 禮貌性間隔，避免對來源網站造成負擔
+
+    return all_items
+
+
 def parse_generic_listing(soup, source):
     """通用 HTML 解析邏輯（適用於未指定專屬 parser 的來源）。
     item_selector / title_selector / link_selector 為 CSS selector，
@@ -466,10 +533,19 @@ def try_parse_time(text):
 
 
 def _apply_yuenan_published_time(item, html_content):
-    """從文章內頁 HTML 中解析精確發布時間，成功則寫入 item['published']。"""
+    """從文章內頁 HTML 中解析精確發布時間，成功則寫入 item['published']。
+    selector 依序放寬嘗試，避免不同文章模板的 class 組合略有差異
+    （例如編輯過的文章可能是 class="entry-date updated" 而非 published）
+    導致明明頁面正確、卻抓不到時間。
+    """
     try:
         soup = BeautifulSoup(html_content, "html.parser")
-        time_el = soup.select_one("time.entry-date.published") or soup.select_one("time.published")
+        time_el = (
+            soup.select_one("time.entry-date.published")
+            or soup.select_one("time.entry-date")
+            or soup.select_one("time.published")
+            or soup.select_one("time[datetime]")
+        )
         if time_el:
             dt_str = time_el.get("datetime")
             if dt_str:
@@ -559,9 +635,16 @@ def enrich_yuenan_published_times(items):
                         )
                         break
                     try:
-                        # 同 _fetch_page_html：改用 domcontentloaded 避免 networkidle
-                        # 因背景雜訊請求而幾乎必定逾時的問題，並縮短單頁逾時時間。
+                        # domcontentloaded 只保證「頁面骨架」載入完成，若網站在載入過程中
+                        # 出現 Cloudflare 之類的安全驗證中介頁面，此時讀到的會是驗證頁面本身
+                        # 而非真正的文章內容（因此抓不到時間標籤，卻也不會拋出例外或逾時）。
+                        # 這裡額外明確等待「time 標籤實際出現」，讓驗證頁面的 JS 有機會完成
+                        # 跳轉；等不到就直接放棄該篇，不影響其他文章的處理速度。
                         page.goto(it["link"], timeout=15000, wait_until="domcontentloaded")
+                        try:
+                            page.wait_for_selector("time.entry-date, time[datetime]", timeout=8000)
+                        except Exception:
+                            pass  # 等不到也繼續嘗試讀取目前內容，交給下面的 selector 容錯處理
                         if _apply_yuenan_published_time(it, page.content()):
                             success_count += 1
                             consecutive_failures = 0
@@ -583,6 +666,8 @@ def collect_all_items():
     for source in SOURCES + google_news_rss_sources():
         if source["type"] == "rss":
             fetched = fetch_rss(source)
+        elif source.get("parser") == "yuenan":
+            fetched = fetch_yuenan_paginated(source)
         else:
             fetched = fetch_html(source)
         source_counts.append((source["name"], len(fetched)))

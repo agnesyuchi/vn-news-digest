@@ -3,4 +3,4 @@ beautifulsoup4==4.12.3
 requests==2.32.3
 pytz==2024.1
 python-dateutil==2.9.0
-google-genai==0.3.0
+google-genai>=1.0.0

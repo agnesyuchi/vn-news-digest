@@ -25,6 +25,9 @@ jobs:
       - name: 安裝套件
         run: pip install -r requirements.txt
 
+      - name: 安裝 Playwright 瀏覽器（用於繞過防爬蟲網站）
+        run: playwright install --with-deps chromium
+
       - name: 執行爬蟲與 Gemini 分類翻譯
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

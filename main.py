@@ -275,6 +275,32 @@ def _parse_relative_chinese_time(text, reference_dt):
     return try_parse_time(text)
 
 
+def _is_within_roughly_24h(text):
+    """【步驟一：粗篩】依列表頁的相對時間文字（例如「2小时前」），
+    粗略判斷這則新聞是否可能落在「24 小時內」，決定要不要進一步花成本
+    造訪文章內頁取得精確時間。判斷從寬：格式無法辨識時一律視為候選
+    （寧可多查一次，也不要漏掉真正在區間內的新聞）。
+    """
+    text = text.strip()
+    if text in ("刚刚", "剛剛", "昨天"):
+        return True
+
+    m = re.match(r"(\d+)\s*分钟前", text) or re.match(r"(\d+)\s*分鐘前", text)
+    if m:
+        return True
+
+    m = re.match(r"(\d+)\s*小时前", text) or re.match(r"(\d+)\s*小時前", text)
+    if m:
+        return int(m.group(1)) <= 24
+
+    m = re.match(r"(\d+)\s*天前", text)
+    if m:
+        # 「1天前」可能落在區間邊界附近，保留為候選；2天以上明顯超出範圍，直接排除。
+        return int(m.group(1)) <= 1
+
+    return True  # 格式未知，保守納入候選
+
+
 def parse_yuenan_listing(html, base_url, source_name):
     """越南投資 (yuenan.com) 專屬解析邏輯。
     實際頁面結構（依使用者提供的頁面原始碼確認）：
@@ -289,6 +315,13 @@ def parse_yuenan_listing(html, base_url, source_name):
         </div>
     item-content 與 item-meta 是「兄弟節點」，因此改用 find_next_sibling 取得對應的
     item-meta，而非依賴不確定的外層容器 class 名稱。
+
+    時間判斷採兩步驟：
+    【步驟一】先用這裡解析出的相對時間文字（如「2小时前」）做粗略判斷與估算時間，
+             同時標記是否為「24 小時內候選」（_within_24h_candidate）。
+    【步驟二】實際精確時間交由 enrich_yuenan_published_times() 進一步造訪文章內頁、
+             讀取 entry-date published 補齊——只針對步驟一判定為候選的項目執行，
+             避免對明顯超出範圍的舊文章浪費抓取次數。
     """
     soup = BeautifulSoup(html, "html.parser")
     reference_dt = datetime.now(VN_TZ)
@@ -306,19 +339,23 @@ def parse_yuenan_listing(html, base_url, source_name):
             continue
 
         published_dt = None
+        within_24h_candidate = True  # 找不到時間標籤時，保守視為候選
         item_content = h3.find_parent("div", class_="item-content")
         if item_content:
             item_meta = item_content.find_next_sibling("div", class_="item-meta")
             if item_meta:
                 date_el = item_meta.select_one(".item-meta-li.date") or item_meta.select_one(".date")
                 if date_el:
-                    published_dt = _parse_relative_chinese_time(date_el.get_text(strip=True), reference_dt)
+                    date_text = date_el.get_text(strip=True)
+                    published_dt = _parse_relative_chinese_time(date_text, reference_dt)
+                    within_24h_candidate = _is_within_roughly_24h(date_text)
 
         items.append({
             "title": title,
             "link": link,
             "published": published_dt,
             "source": source_name,
+            "_within_24h_candidate": within_24h_candidate,
         })
 
     return items, soup
@@ -445,22 +482,32 @@ def _apply_yuenan_published_time(item, html_content):
 
 
 def enrich_yuenan_published_times(items):
-    """針對任何連結指向 yuenan.com、但目前抓不到精確發布時間的項目，
-    進一步造訪該篇文章的內頁，讀取標準格式的發布時間標籤：
+    """【步驟二：精確查證】針對「步驟一（列表頁相對時間粗篩）」判定為
+    24 小時內候選的 yuenan.com 文章，進一步造訪該篇文章的內頁，
+    讀取標準格式的發布時間標籤：
         <time class="entry-date published" datetime="2026-08-14T17:08:03+07:00">
-    這個時間戳精確到秒且含時區，比列表頁「2小时前」這類相對時間可靠許多，
-    可用來補強／取代原本解析失敗或不精確的時間。
+    這個時間戳精確到秒且含時區，用來取代列表頁「2小时前」這類相對時間估算值。
+
+    明顯超出 24 小時範圍的文章（例如「2天前」以上）在步驟一就已標記為非候選，
+    這裡不會浪費抓取次數在這些文章上，只需保留其估算時間供時間篩選階段判斷即可。
+
     此函式會直接修改傳入 items 中符合條件項目的 "published" 欄位。
 
     效能考量：先用較快的 requests / curl_cffi 嘗試每篇文章；只有這兩種方式
     都失敗的文章，才集中改用「同一個」Playwright 瀏覽器實例依序處理
     （而非每篇文章各自啟動一次瀏覽器），因為啟動瀏覽器的成本遠高於單純換頁。
     """
-    targets = [it for it in items if "yuenan.com" in it["link"] and it.get("published") is None]
+    targets = [
+        it for it in items
+        if "yuenan.com" in it["link"] and it.get("_within_24h_candidate", True)
+    ]
+    skipped = sum(1 for it in items if "yuenan.com" in it["link"]) - len(targets)
+    if skipped:
+        print(f"[INFO] {skipped} 篇 yuenan.com 文章依列表頁時間判斷明顯超出 24 小時範圍，略過精確查證", file=sys.stderr)
     if not targets:
         return
 
-    print(f"[INFO] 針對 {len(targets)} 筆 yuenan.com 文章嘗試從文章內頁取得精確發布時間", file=sys.stderr)
+    print(f"[INFO] 針對 {len(targets)} 筆 24 小時內候選文章造訪內頁取得精確發布時間", file=sys.stderr)
 
     success_count = 0
     needs_playwright = []
@@ -661,14 +708,17 @@ def _call_gemini_with_retry(prompt, api_key, max_retries=3):
 #
 # 先前版本將「語意去重」與「翻譯＋分類」拆成兩階段、且分類階段又依 15 筆一批
 # 分批呼叫，單次執行合計可能耗用 8 次以上的 API 請求。Gemini 的上下文視窗
-# 大到可以一次容納數百則新聞標題，因此改為「單一 prompt、單一次呼叫」
-# 同時完成去重、翻譯、分類三件事，將每日請求次數大幅降低，
-# 也避免分類規則文字被重複傳送多次而浪費 token。
+# 大到可以一次容納數百則新聞標題，因此改為「單一 prompt」同時完成去重、
+# 翻譯、分類三件事，也避免分類規則文字被重複傳送多次而浪費 token。
 #
-# 為避免單日新聞量異常龐大時單一請求過大，仍保留 DEDUPE_CLASSIFY_BATCH_SIZE
-# 作為安全上限；超過此上限才會切成多個批次（正常情況下應恆為 1 次請求）。
-
-DEDUPE_CLASSIFY_BATCH_SIZE = 300
+# DEDUPE_CLASSIFY_BATCH_SIZE 的設定是「低呼叫次數」與「判斷精準度」的折衷：
+# 批次設太大（例如一次塞 300 筆），單一 prompt 內要同時比對的項目過多，
+# 模型在語意去重的兩兩比對、以及分類判斷的細緻度上都可能因資訊量過大而下降，
+# 且大型 JSON 陣列的輸出格式也較容易出錯。批次設太小則會回到原本 8 次以上
+# 呼叫的問題。實務取中間值：以一般每日 100~150 筆的規模估算，
+# 50 筆一批約可將呼叫次數壓在 3 次以內，同時讓模型在合理的比對範圍內
+# 維持判斷品質。
+DEDUPE_CLASSIFY_BATCH_SIZE = 50
 
 CATEGORY_RULES = """
 判斷角度：請以「台灣、越南、寮國外交部門」會關注的事項為標準，而非單純規模大小。
@@ -731,7 +781,9 @@ def build_combined_prompt(items):
         f'{i+1}. 「{it["title"]}」（來源：{it["source"]}）'
         for i, it in enumerate(items)
     )
-    return f"""你是一位外交部新聞資訊編輯，請對以下新聞清單依序完成三項任務：
+    return f"""你是一位外交部新聞資訊編輯，請對以下新聞清單依序完成三項任務。
+清單可能有數十則之多，請逐一仔細判斷每一則，不要因為清單較長就簡化或跳過判斷邏輯——
+去重比對、翻譯品質、分類準確度都必須維持一致的嚴謹程度，不因項目數量而打折扣。
 
 【任務一：去重】找出所有屬於「同一新聞事件」的重複報導（例如同一則消息被不同媒體轉載、
 或用不同標題描述同一件事），每組只保留一則代表性項目（優先保留非「Google News 轉載」

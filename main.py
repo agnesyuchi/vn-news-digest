@@ -34,13 +34,20 @@ from bs4 import BeautifulSoup
 
 VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")  # UTC+7，寮國與越南同時區
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-3.5-flash"
+# 註：Gemini 模型名稱會隨時間淘汰／更新（例如 gemini-1.5-flash 已於 2025 年停用）。
+# 若之後執行時又出現「404 NOT_FOUND ... is not found for API version」，
+# 表示這裡設定的模型名稱已被 Google 淘汰，請至 https://ai.google.dev/gemini-api/docs/models
+# 查詢目前可用的最新模型名稱並更新此變數。
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Referer": "https://www.google.com/",
 }
 
 # 關鍵字（用於 Google News RSS 搜尋，以及 CNA 網站內搜尋）
@@ -53,7 +60,7 @@ KEYWORDS = ["越南", "寮國"]
 # type = "html" : 用 requests + BeautifulSoup 解析，需自行依實際網站結構調整
 #                 list_selector / title_selector / link_selector 為 CSS selector
 #
-# 重要：yuenan.com、CNA 搜尋結果頁的實際 HTML 結構會隨網站改版而變動，
+# 重要：yuenan.com 的實際 HTML 結構會隨網站改版而變動，
 #       下方 selector 僅為「範例寫法」，部署前請務必打開瀏覽器「檢查元素」
 #       確認實際 class/id 名稱，並修改對應 selector。
 
@@ -76,27 +83,22 @@ SOURCES = [
         # 若中文版無獨立 RSS，可改用其英文/越南文版 RSS 後仍以標題原文送入 Gemini 翻譯。
         "feed_url": "https://zh.vietnamplus.vn/rss/home.rss",
     },
-    {
-        "name": "中央通訊社 (CNA) - 越南",
-        "type": "html",
-        "list_url": "https://www.cna.com.tw/search/hasco.aspx?q=%E8%B6%8A%E5%8D%97",
-        "item_selector": "li.item, .searchList li",
-        "title_selector": "h2, .title",
-        "link_selector": "a",
-        "time_selector": "time, .date",
-    },
-    {
-        "name": "中央通訊社 (CNA) - 寮國",
-        "type": "html",
-        "list_url": "https://www.cna.com.tw/search/hasco.aspx?q=%E5%AF%AE%E5%9C%8B",
-        "item_selector": "li.item, .searchList li",
-        "title_selector": "h2, .title",
-        "link_selector": "a",
-        "time_selector": "time, .date",
-    },
+    # 中央通訊社 (CNA) 官方站內搜尋頁為前端 JavaScript 動態載入結果，
+    # 無法用一般 requests + BeautifulSoup 直接取得資料（搜尋網址也常隨改版變動）。
+    # 因此 CNA 改用下方「Google News 站內搜尋」方式間接取得，較穩定可靠。
 ]
 
 # Google News RSS：依關鍵字動態組出搜尋 RSS 網址
+# 除了關鍵字全站搜尋，也加入「site: 限定網域」查詢，作為 yuenan.com、CNA、
+# VietnamPlus 等來源在直接爬蟲失敗時的可靠替代管道（Google News 索引穩定、不受目標網站
+# 反爬蟲機制影響）。
+SITE_RESTRICTED_SOURCES = [
+    ("yuenan.com", "越南投資 (Google News 轉載)"),
+    ("cna.com.tw", "中央通訊社 CNA (Google News 轉載)"),
+    ("zh.vietnamplus.vn", "VietnamPlus 中文網 (Google News 轉載)"),
+]
+
+
 def google_news_rss_sources():
     sources = []
     for kw in KEYWORDS:
@@ -108,6 +110,15 @@ def google_news_rss_sources():
                 f"&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
             ),
         })
+        for site, label in SITE_RESTRICTED_SOURCES:
+            sources.append({
+                "name": f"{label} - {kw}",
+                "type": "rss",
+                "feed_url": (
+                    f"https://news.google.com/rss/search?q=site:{site}+{kw}"
+                    f"&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+                ),
+            })
     return sources
 
 

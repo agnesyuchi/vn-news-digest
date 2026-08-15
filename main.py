@@ -72,7 +72,7 @@ KEYWORDS = ["越南", "寮國"]
 
 SOURCES = [
     {
-        "name": "越南投資 (yuenan.com)",
+        "name": "越南中文社",
         "type": "html",
         "list_url": "https://yuenan.com/news/",
         # 此來源改用專屬解析邏輯（見 parse_yuenan_listing / fetch_yuenan_paginated），
@@ -98,7 +98,7 @@ SOURCES = [
 # 除了關鍵字全站搜尋，也加入「site: 限定網域」查詢，作為 yuenan.com、CNA、
 # VietnamPlus 等來源在直接爬蟲失敗時的可靠替代管道。
 SITE_RESTRICTED_SOURCES = [
-    ("yuenan.com", "越南投資"),
+    ("yuenan.com", "越南中文社"),
     ("cna.com.tw", "中央通訊社 CNA"),
     ("zh.vietnamplus.vn", "VietnamPlus 中文網"),
 ]
@@ -183,6 +183,11 @@ def fetch_rss(source):
             if source.get("via_google_news"):
                 origin, cleaned_title = _extract_google_news_origin(entry, raw_title)
                 title = cleaned_title
+                # yuenan.com 的文章不論是直接爬取或經 Google News 轉載，
+                # 一律統一標註為「越南中文社」，不採用 Google News 自行回報的
+                # 媒體名稱（可能與網站自稱不一致，例如網域名稱或英文名稱）。
+                if "yuenan.com" in link:
+                    origin = "越南中文社"
                 if origin:
                     source_name = f"{origin}（Google News 轉載）"
                 else:
@@ -305,7 +310,7 @@ def _is_within_roughly_24h(text):
 
 
 def parse_yuenan_listing(html, base_url, source_name):
-    """越南投資 (yuenan.com) 專屬解析邏輯。
+    """越南中文社 (yuenan.com) 專屬解析邏輯。
     實際頁面結構（依使用者提供的頁面原始碼確認）：
         <div class="item-content">
             <h3 class="item-title"><a href="...">標題</a></h3>
@@ -365,7 +370,7 @@ def parse_yuenan_listing(html, base_url, source_name):
 
 
 def fetch_yuenan_paginated(source):
-    """越南投資 (yuenan.com) 專用：自動翻頁抓取，直到遇到超出 24 小時範圍的
+    """越南中文社 (yuenan.com) 專用：自動翻頁抓取，直到遇到超出 24 小時範圍的
     文章為止（或達到 max_pages 上限）。
 
     停止邏輯：新聞列表通常依時間新到舊排列，因此只要「當前頁面的所有文章」
@@ -871,12 +876,17 @@ def build_combined_prompt(items):
 去重比對、翻譯品質、分類準確度都必須維持一致的嚴謹程度，不因項目數量而打折扣。
 
 【任務一：去重】找出所有屬於「同一新聞事件」的重複報導（例如同一則消息被不同媒體轉載、
-或用不同標題描述同一件事），每組只保留一則代表性項目（優先保留非「Google News 轉載」
-的原始出處；若整組都是或都不是轉載，保留編號最小的一則）。不確定是否重複時，
-不要視為重複（寧可漏判，不要誤判）。
+或用不同標題描述同一件事），每組只保留一則代表性項目。保留優先順序如下（由高到低）：
+(1) 若該組中有任何一則來源為「中央通訊社」（CNA）的報導，一律優先保留該則；
+(2) 若無中央社來源，優先保留非「Google News 轉載」的原始出處；
+(3) 若以上條件仍無法區分，保留編號最小的一則。
+不確定是否重複時，不要視為重複（寧可漏判，不要誤判）。
 
-【任務二：翻譯】針對「保留下來」的每一則新聞，將標題翻譯／轉寫為繁體中文，
-語氣維持新聞標題的簡潔客觀風格。
+【任務二：翻譯】針對「保留下來」的每一則新聞，將標題轉寫為「繁體中文」（台灣慣用字形），
+語氣維持新聞標題的簡潔客觀風格。特別注意：若新聞來源本身已是簡體中文（例如部分中國大陸
+或越南中文媒體慣用簡體字），仍必須逐字轉換為繁體中文（例如：国→國、这→這、说→說、
+们→們、报→報），不可因為原文「已經是中文」就直接原樣保留簡體字。所有輸出的 title_zh
+一律不得含有任何簡體字。
 
 【任務三：分類】任務是從中篩選出「對台灣、越南、寮國外交部門具有參考價值」的新聞——
 包括外交互動、經貿政策、供應鏈地緣政治、領事僑務保護等面向，而不是只挑選規模最大的頭條。

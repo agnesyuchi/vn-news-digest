@@ -286,11 +286,16 @@ def _parse_relative_chinese_time(text, reference_dt):
 def _is_within_roughly_24h(text):
     """【步驟一：粗篩】依列表頁的相對時間文字（例如「2小时前」），
     粗略判斷這則新聞是否可能落在「24 小時內」，決定要不要進一步花成本
-    造訪文章內頁取得精確時間。判斷從寬：格式無法辨識時一律視為候選
-    （寧可多查一次，也不要漏掉真正在區間內的新聞）。
+    造訪文章內頁取得精確時間。
+
+    依網站實際慣例（已確認）：超過 24 小時的文章會改用「X天前」格式顯示，
+    因此只要是「X小时前」「X分钟前」「刚刚」這類「小時內」格式，就代表在
+    24 小時範圍內；只要出現「天前」（即使是「1天前」），依網站慣例即代表
+    已超過 24 小時，一律排除，不再視為候選。
+    格式完全無法辨識時，保守視為候選（寧可多查一次，也不要漏掉在區間內的新聞）。
     """
     text = text.strip()
-    if text in ("刚刚", "剛剛", "昨天"):
+    if text in ("刚刚", "剛剛"):
         return True
 
     m = re.match(r"(\d+)\s*分钟前", text) or re.match(r"(\d+)\s*分鐘前", text)
@@ -299,34 +304,43 @@ def _is_within_roughly_24h(text):
 
     m = re.match(r"(\d+)\s*小时前", text) or re.match(r"(\d+)\s*小時前", text)
     if m:
-        return int(m.group(1)) <= 24
+        return True  # 依網站慣例，只要顯示「小時前」格式即代表在 24 小時內
 
     m = re.match(r"(\d+)\s*天前", text)
     if m:
-        # 「1天前」可能落在區間邊界附近，保留為候選；2天以上明顯超出範圍，直接排除。
-        return int(m.group(1)) <= 1
+        return False  # 依網站慣例，只要顯示「天前」（含「1天前」）即代表已超過 24 小時
+
+    if text in ("昨天",):
+        return False
 
     return True  # 格式未知，保守納入候選
 
 
 def parse_yuenan_listing(html, base_url, source_name):
     """越南中文社 (yuenan.com) 專屬解析邏輯。
-    實際頁面結構（依使用者提供的頁面原始碼確認）：
-        <div class="item-content">
+    實際頁面結構（已由使用者透過瀏覽器開發者工具確認）：
+        <li class="item">
+          <div class="item-content">
             <h3 class="item-title"><a href="...">標題</a></h3>
             <div class="item-excerpt">...</div>
-        </div>
-        <div class="item-meta">
-            ...
-            <span class="item-meta-li date">2小时前</span>
-            ...
-        </div>
-    item-content 與 item-meta 是「兄弟節點」，因此改用 find_next_sibling 取得對應的
-    item-meta，而非依賴不確定的外層容器 class 名稱。
+            <div class="item-meta">                 ← 是 item-content 的「子節點」，
+              <div class="item-meta-li author">...</div>   而非先前誤判的兄弟節點
+              <span class="item-meta-li date">22小时前</span>
+              <div class="item-meta-right"></div>
+            </div>
+          </div>
+        </li>
+
+    因此時間解析改為：以每個 div.item-content 為範圍，往「自己內部」搜尋
+    對應的 item-meta / 時間文字，而非依賴兄弟節點關係或跨頁位置對應
+    （這兩種寫法先前都已證實與實際頁面結構不符，前者方向錯誤、後者則會被
+    頁面上其他非新聞用途的 item-meta 干擾而錯位）。在同一個 item-content
+    範圍內搜尋可以確保抓到的一定是「這則新聞自己的」時間資訊，不會搭錯。
 
     時間判斷採兩步驟：
     【步驟一】先用這裡解析出的相對時間文字（如「2小时前」）做粗略判斷與估算時間，
              同時標記是否為「24 小時內候選」（_within_24h_candidate）。
+             依網站慣例，只有「X小时前」格式才視為候選，「X天前」一律排除。
     【步驟二】實際精確時間交由 enrich_yuenan_published_times() 進一步造訪文章內頁、
              讀取 entry-date published 補齊——只針對步驟一判定為候選的項目執行，
              避免對明顯超出範圍的舊文章浪費抓取次數。
@@ -335,7 +349,12 @@ def parse_yuenan_listing(html, base_url, source_name):
     reference_dt = datetime.now(VN_TZ)
     items = []
 
-    for h3 in soup.select("h3.item-title"):
+    item_content_blocks = soup.select("div.item-content")
+
+    for item_content in item_content_blocks:
+        h3 = item_content.select_one("h3.item-title")
+        if not h3:
+            continue
         a = h3.select_one("a")
         if not a:
             continue
@@ -348,15 +367,13 @@ def parse_yuenan_listing(html, base_url, source_name):
 
         published_dt = None
         within_24h_candidate = True  # 找不到時間標籤時，保守視為候選
-        item_content = h3.find_parent("div", class_="item-content")
-        if item_content:
-            item_meta = item_content.find_next_sibling("div", class_="item-meta")
-            if item_meta:
-                date_el = item_meta.select_one(".item-meta-li.date") or item_meta.select_one(".date")
-                if date_el:
-                    date_text = date_el.get_text(strip=True)
-                    published_dt = _parse_relative_chinese_time(date_text, reference_dt)
-                    within_24h_candidate = _is_within_roughly_24h(date_text)
+
+        # 在同一個 item-content 範圍內搜尋時間文字，確保不會搭到其他項目的時間。
+        date_el = item_content.select_one(".item-meta-li.date") or item_content.select_one(".date")
+        if date_el:
+            date_text = date_el.get_text(strip=True)
+            published_dt = _parse_relative_chinese_time(date_text, reference_dt)
+            within_24h_candidate = _is_within_roughly_24h(date_text)
 
         items.append({
             "title": title,
@@ -410,6 +427,17 @@ def fetch_yuenan_paginated(source):
                 # 第一頁就抓不到任何項目，代表版面結構可能已變動，印出除錯資訊。
                 _debug_dump_html_snippet(source["name"], soup)
             break
+
+        # 診斷機制：若這一頁有抓到標題，卻「完全沒有任何一筆」成功解析出時間，
+        # 代表時間相關的 selector 可能已經對不上實際頁面結構（而非單純候選判斷問題）。
+        # 只在第一頁觸發一次，避免每頁都重複印出大量診斷資訊。
+        if page_num == 1 and page_items and all(it["published"] is None for it in page_items):
+            print(
+                f"[WARN] {source['name']} 第 {page_num} 頁抓到 {len(page_items)} 筆標題，"
+                f"但完全沒有任何一筆解析出時間，可能是時間標籤的 selector 已與實際頁面不符。",
+                file=sys.stderr,
+            )
+            _debug_dump_yuenan_time_markup(soup, source["name"])
 
         all_items.extend(page_items)
 
@@ -521,6 +549,50 @@ def _debug_dump_html_snippet(source_name, soup):
         print(f"[DEBUG]   文字: 「{text}」 | href: {href[:60]} | 父層: {parent_desc} | 祖父層: {grandparent_desc}", file=sys.stderr)
 
     print(f"[DEBUG] ===== {source_name} 頁面結構除錯資訊結束 =====", file=sys.stderr)
+
+
+def _debug_dump_yuenan_time_markup(soup, source_name):
+    """當偵測到「有抓到標題、但完全沒抓到任何時間」時觸發，直接印出頁面中
+    實際的時間相關 HTML 結構，取代繼續盲猜 selector。
+
+    診斷邏輯分兩層：
+    1. 先確認 div.item-meta 區塊本身是否真的存在（數量是否為 0）；
+       若存在，印出第一個區塊的完整 HTML，直接看內部真正的時間標籤寫法。
+    2. 若連 div.item-meta 都找不到，改用關鍵字搜尋整個頁面中「含有時間相關
+       文字（前、刚刚、剛剛）」的元素，列出其標籤名稱、class、文字內容，
+       藉此定位時間資訊實際被放在哪個元素裡。
+    """
+    print(f"[DEBUG] ===== {source_name} 時間標籤結構診斷開始 =====", file=sys.stderr)
+
+    meta_divs = soup.select("div.item-meta")
+    print(f"[DEBUG] 頁面中 div.item-meta 數量: {len(meta_divs)}", file=sys.stderr)
+
+    if meta_divs:
+        sample_html = str(meta_divs[0])
+        print(f"[DEBUG] 第一個 item-meta 區塊完整 HTML：\n{sample_html[:1500]}", file=sys.stderr)
+    else:
+        print(f"[DEBUG] 找不到任何 div.item-meta，改用關鍵字搜尋含相對時間文字的元素：", file=sys.stderr)
+        time_keyword_pattern = re.compile(r"(前|刚刚|剛剛)")
+        seen_texts = set()
+        count = 0
+        for text_node in soup.find_all(string=time_keyword_pattern):
+            parent = text_node.parent
+            if not parent:
+                continue
+            text = parent.get_text(strip=True)
+            if not text or text in seen_texts or len(text) > 30:
+                continue
+            seen_texts.add(text)
+            cls = " ".join(parent.get("class", []))
+            print(f"[DEBUG]   <{parent.name} class='{cls}'>{text}</{parent.name}>", file=sys.stderr)
+            count += 1
+            if count >= 10:
+                break
+        if count == 0:
+            print(f"[DEBUG] 完全找不到含「前」「刚刚」等相對時間關鍵字的文字，"
+                  f"該頁面可能不含相對時間資訊，或使用其他時間表示格式。", file=sys.stderr)
+
+    print(f"[DEBUG] ===== {source_name} 時間標籤結構診斷結束 =====", file=sys.stderr)
 
 
 def try_parse_time(text):
@@ -658,6 +730,11 @@ def enrich_yuenan_published_times(items):
                     except Exception as e:
                         print(f"[WARN] Playwright 抓取文章內頁失敗 ({it['link']}): {e}", file=sys.stderr)
                         consecutive_failures += 1
+
+                    # 同一瀏覽器工作階段短時間內連續造訪大量頁面，容易被 Cloudflare 之類的
+                    # 防護機制依「行為模式」判定為機器人（即使個別請求本身沒有問題）。
+                    # 加入間隔時間讓造訪節奏更接近真人操作，降低觸發風險。
+                    time.sleep(2)
                 browser.close()
         except Exception as e:
             print(f"[WARN] Playwright 初始化失敗，剩餘文章無法補齊精確時間: {e}", file=sys.stderr)
@@ -744,6 +821,15 @@ def dedupe_by_url(items):
 # 多個來源（原始網站 + Google News 轉載 + 不同媒體報導同一事件）常出現
 # 標題文字不同、但描述同一則新聞的情況，用語意判斷合併只保留一則。
 # ---------------------------------------------------------------------------
+
+def _format_time_for_prompt(published_dt):
+    """將 datetime 格式化為 prompt 中易讀的文字，讓 Gemini 能判斷新舊。
+    時間未知時明確標示「未知」，而非留空或顯示 None，避免模型誤判。
+    """
+    if published_dt is None:
+        return "未知"
+    return published_dt.strftime("%Y-%m-%d %H:%M")
+
 
 def _clean_json_block(text):
     return re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
@@ -868,18 +954,28 @@ CATEGORY_RULES = """
 
 def build_combined_prompt(items):
     numbered = "\n".join(
-        f'{i+1}. 「{it["title"]}」（來源：{it["source"]}）'
+        f'{i+1}. 「{it["title"]}」（來源：{it["source"]}；發布時間：{_format_time_for_prompt(it.get("published"))}）'
         for i, it in enumerate(items)
     )
     return f"""你是一位外交部新聞資訊編輯，請對以下新聞清單依序完成三項任務。
 清單可能有數十則之多，請逐一仔細判斷每一則，不要因為清單較長就簡化或跳過判斷邏輯——
 去重比對、翻譯品質、分類準確度都必須維持一致的嚴謹程度，不因項目數量而打折扣。
 
-【任務一：去重】找出所有屬於「同一新聞事件」的重複報導（例如同一則消息被不同媒體轉載、
-或用不同標題描述同一件事），每組只保留一則代表性項目。保留優先順序如下（由高到低）：
+【任務一：去重】找出所有屬於「重複內容」的報導，包含兩種情況都算重複：
+(a) 描述同一則具體新聞事件，只是不同媒體轉載或標題用詞不同；
+(b) 描述「同一個持續性主題或系列進展」，核心議題高度重疊，僅報導角度、細節或
+    統計數字略有不同（例如同一機場的無人機／風箏干擾問題被多次以不同標題報導、
+    同一事件的後續追蹤報導）。
+若是各自獨立、具有不同具體資訊的個別事件（例如不同地點、不同日期發生的不同意外），
+則不算重複，應個別保留，不要過度合併。
+
+每組重複項目只保留一則代表性項目，保留優先順序如下（由高到低）：
 (1) 若該組中有任何一則來源為「中央通訊社」（CNA）的報導，一律優先保留該則；
-(2) 若無中央社來源，優先保留非「Google News 轉載」的原始出處；
-(3) 若以上條件仍無法區分，保留編號最小的一則。
+(2) 若無中央社來源，優先保留「發布時間最新」的一則（每則新聞後方已標註發布時間，
+    時間未知的視為最舊，優先順序最低）；
+(3) 若以上條件仍無法區分（例如時間相同或都未知），優先保留非「Google News 轉載」
+    的原始出處；
+(4) 若以上條件皆無法區分，保留編號最小的一則。
 不確定是否重複時，不要視為重複（寧可漏判，不要誤判）。
 
 【任務二：翻譯】針對「保留下來」的每一則新聞，將標題轉寫為「繁體中文」（台灣慣用字形），

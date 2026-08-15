@@ -13,7 +13,8 @@ from rapidfuzz import fuzz
 # ==========================================
 # 設定與常數定義
 # ==========================================
-GEMINI_MODEL = "gemini-2.0-flash"
+# 修正：使用廣泛支援且穩定的 gemini-1.5-flash 模型
+GEMINI_MODEL = "gemini-1.5-flash"
 
 # 設定越南時間 (UTC+7)
 VN_TZ = timezone(timedelta(hours=7))
@@ -34,11 +35,10 @@ HEADERS = {
 # ==========================================
 
 def fetch_cna_rss() -> List[Dict[str, str]]:
-    """ 管道 1: 中央社 (CNA) 官方 RSS """
-    print("[1/5] 抓取 中央社 (CNA) RSS...")
+    """ 管道 1: 中央社 (CNA) 透過 Google RSS 專屬搜尋（避免本地關鍵字比對遺漏） """
+    print("[1/5] 抓取 中央社 (CNA) 越南相關新聞...")
     articles = []
-    # 中央社即時新聞 RSS
-    rss_url = "https://feeds.feedburner.com/rsscna/realtime"
+    rss_url = "https://news.google.com/rss/search?q=site:cna.com.tw+%E8%B6%8A%E5%8D%97&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     
     try:
         resp = requests.get(rss_url, headers=HEADERS, timeout=15)
@@ -49,30 +49,30 @@ def fetch_cna_rss() -> List[Dict[str, str]]:
                 link = item.link.text.strip() if item.link else ""
                 pub_date = item.pubDate.text.strip() if item.pubDate else ""
                 
-                # 篩選標題包含越南相關關鍵字的新聞
-                if any(kw in title for kw in ["越南", "河內", "胡志明", "越共"]):
+                title_clean = re.sub(r"\s*-\s*.*$", "", title)
+                if title_clean and link:
                     articles.append({
-                        "title": title,
+                        "title": title_clean,
                         "url": link,
                         "source": "中央社 (CNA)",
                         "pub_date": pub_date
                     })
     except Exception as e:
-        print(f"抓取 中央社 RSS 失敗: {e}")
+        print(f"抓取 中央社 失敗: {e}")
         
-    print(f" -> 中央社 RSS 抓取到 {len(articles)} 篇相關新聞")
+    print(f" -> 中央社 抓取到 {len(articles)} 篇相關新聞")
     return articles
 
 
 def fetch_yuenan_rss() -> List[Dict[str, str]]:
-    """ 管道 2: yuenan.com 官方 RSS """
+    """ 管道 2: yuenan.com (優先 RSS，若被擋則轉 Google RSS 備援) """
     print("[1/5] 抓取 yuenan.com RSS...")
     articles = []
     rss_url = "https://yuenan.com/feed/"
     
     try:
-        resp = requests.get(rss_url, headers=HEADERS, timeout=15)
-        if resp.status_code == 200:
+        resp = requests.get(rss_url, headers=HEADERS, timeout=10)
+        if resp.status_code == 200 and "xml" in resp.headers.get("Content-Type", ""):
             soup = BeautifulSoup(resp.content, "xml")
             for item in soup.find_all("item"):
                 title = item.title.text.strip() if item.title else ""
@@ -87,9 +87,32 @@ def fetch_yuenan_rss() -> List[Dict[str, str]]:
                         "pub_date": pub_date
                     })
     except Exception as e:
-        print(f"抓取 yuenan.com RSS 失敗: {e}")
+        print(f"yuenan.com 直抓 RSS 受阻，啟動備援機制: {e}")
         
-    print(f" -> yuenan.com RSS 抓取到 {len(articles)} 篇新聞")
+    # 若直接抓 RSS 為空，改用 Google RSS 針對 yuenan.com 抓取
+    if not articles:
+        print("   -> 啟用 yuenan.com 備援搜尋管道...")
+        backup_url = "https://news.google.com/rss/search?q=site:yuenan.com&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        try:
+            resp = requests.get(backup_url, headers=HEADERS, timeout=15)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.content, "xml")
+                for item in soup.find_all("item"):
+                    title = item.title.text.strip() if item.title else ""
+                    link = item.link.text.strip() if item.link else ""
+                    pub_date = item.pubDate.text.strip() if item.pubDate else ""
+                    title_clean = re.sub(r"\s*-\s*.*$", "", title)
+                    if title_clean and link:
+                        articles.append({
+                            "title": title_clean,
+                            "url": link,
+                            "source": "yuenan.com",
+                            "pub_date": pub_date
+                        })
+        except Exception as e:
+            print(f"yuenan.com 備援搜尋失敗: {e}")
+
+    print(f" -> yuenan.com 抓取到 {len(articles)} 篇新聞")
     return articles
 
 
@@ -97,7 +120,6 @@ def fetch_google_news_keywords() -> List[Dict[str, str]]:
     """ 管道 3: Google News 廣域關鍵字搜尋 """
     print("[1/5] 抓取 Google News (關鍵字搜尋)...")
     articles = []
-    # 使用包含越南經貿與政經的動態搜尋關鍵字
     query = "越南 (財經 OR 經濟 OR 投資 OR 政治 OR 供應鏈)"
     rss_url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     
@@ -188,11 +210,11 @@ def deduplicate_articles(articles: List[Dict[str, str]], similarity_threshold: f
     return unique_articles
 
 # ==========================================
-# 3. Gemini 語意重疊判斷與三大分類模組
+# 3. Gemini 語意重疊判斷與三分法模組
 # ==========================================
 
 def process_with_gemini(articles: List[Dict[str, str]]) -> Dict[str, Any]:
-    """ 透過 Gemini 2.0 Flash 進行深層語意去重、事件聚類，並強制劃分為 3 個分類 """
+    """ 透過 Gemini API 進行語意去重、事件聚類，並劃分為政治/經濟/其他 """
     print("[3/5] 送交 Gemini 進行語意分析、事件去重與 3 大類別劃分...")
     
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -259,7 +281,6 @@ def process_with_gemini(articles: List[Dict[str, str]]) -> Dict[str, Any]:
             
         result_json = json.loads(raw_text.strip())
         
-        # 統計各類別數量
         articles_list = result_json.get("articles", [])
         result_json["total_count"] = len(articles_list)
         
@@ -320,7 +341,6 @@ def save_data_and_update_index(data: Dict[str, Any]):
 def main():
     print(f"=== 開始執行越南新聞彙整排程 [{TODAY_STR}] ===")
     
-    # 1. 四大管道並行抓取
     cna = fetch_cna_rss()
     yuenan = fetch_yuenan_rss()
     gnews = fetch_google_news_keywords()
@@ -332,13 +352,8 @@ def main():
         print("未抓取到任何新聞，流程結束。")
         return
 
-    # 2. 本地字面相似度去重
     cleaned_articles = deduplicate_articles(raw_articles, similarity_threshold=75.0)
-    
-    # 3. Gemini 深層語意去重與「政治、經濟、其他」三分法
     final_data = process_with_gemini(cleaned_articles)
-    
-    # 4. 寫入 JSON 檔與索引檔
     save_data_and_update_index(final_data)
     
     print("=== 所有程序執行完成 ===")

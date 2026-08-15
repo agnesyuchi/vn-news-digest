@@ -58,6 +58,15 @@ HEADERS = {
 # 關鍵字（用於 Google News RSS 搜尋）
 KEYWORDS = ["越南", "寮國"]
 
+# ---------------------------------------------------------------------------
+# 資料來源設定
+# ---------------------------------------------------------------------------
+# type = "rss"  : 直接用 feedparser 解析
+# type = "html" : 用「curl_cffi 偽裝瀏覽器指紋 → Playwright 實際渲染」兩階段方式取得頁面，
+#                 再用 BeautifulSoup 解析。
+#                 item_selector / title_selector / link_selector 為 CSS selector，
+#                 實際 HTML 結構會隨網站改版而變動，部署前請打開瀏覽器「檢查元素」確認。
+
 SOURCES = [
     {
         "name": "越南投資 (yuenan.com)",
@@ -71,10 +80,17 @@ SOURCES = [
     {
         "name": "VietnamPlus 中文網",
         "type": "rss",
+        # VietnamPlus 多語版通常提供 RSS，實際路徑請以官網公告為準，
+        # 若中文版無獨立 RSS，可改用其英文/越南文版 RSS 後仍以標題原文送入 Gemini 翻譯。
         "feed_url": "https://zh.vietnamplus.vn/rss/home.rss",
     },
+    # 中央通訊社 (CNA) 官方站內搜尋頁為前端 JavaScript 動態載入結果，
+    # 不適合直接爬取（搜尋網址也常隨改版變動），改用下方「Google News 站內搜尋」取得。
 ]
 
+# Google News RSS：依關鍵字動態組出搜尋 RSS 網址
+# 除了關鍵字全站搜尋，也加入「site: 限定網域」查詢，作為 yuenan.com、CNA、
+# VietnamPlus 等來源在直接爬蟲失敗時的可靠替代管道。
 SITE_RESTRICTED_SOURCES = [
     ("yuenan.com", "越南投資"),
     ("cna.com.tw", "中央通訊社 CNA"),
@@ -83,6 +99,10 @@ SITE_RESTRICTED_SOURCES = [
 
 
 def google_news_rss_sources():
+    """建立 Google News RSS 來源清單。
+    這些來源的每一則新聞，其「出處」會在 fetch_rss() 中依 RSS 內容
+    動態解析為實際發布媒體名稱，並統一標註為「XXX（Google News 轉載）」。
+    """
     sources = []
     for kw in KEYWORDS:
         sources.append({
@@ -107,7 +127,16 @@ def google_news_rss_sources():
     return sources
 
 
+# ---------------------------------------------------------------------------
+# 抓取函式：RSS
+# ---------------------------------------------------------------------------
+
 def _extract_google_news_origin(entry, fallback_title):
+    """從 Google News RSS 的單一 entry 中，盡量解析出實際發布媒體名稱。
+    優先讀取 RSS <source> 標籤；若無，退而求其次從標題常見的
+    「標題文字 - 媒體名稱」格式中取出結尾的媒體名稱。
+    回傳 (origin_name_or_None, title_without_suffix)
+    """
     origin = None
     src_field = getattr(entry, "source", None)
     if src_field:
@@ -121,6 +150,7 @@ def _extract_google_news_origin(entry, fallback_title):
         tail = tail.strip()
         if not origin and tail:
             origin = tail
+        # 若結尾片段與解析出的媒體名稱相符，視為標題自帶的來源標記，予以移除
         if origin and tail == origin:
             cleaned_title = head.strip()
 
@@ -128,6 +158,7 @@ def _extract_google_news_origin(entry, fallback_title):
 
 
 def fetch_rss(source):
+    """解析 RSS/Atom feed，回傳 [{title, link, published, source}, ...]"""
     items = []
     try:
         feed = feedparser.parse(source["feed_url"])
@@ -163,7 +194,19 @@ def fetch_rss(source):
     return items
 
 
+# ---------------------------------------------------------------------------
+# 抓取函式：HTML（含防爬蟲繞道機制）
+# ---------------------------------------------------------------------------
+
 def _fetch_page_html(url):
+    """依序嘗試三種方式取得頁面 HTML，回傳 (html_or_None, method_used)：
+      1. requests：最快，適用於沒有防爬蟲機制的網站
+      2. curl_cffi：偽裝瀏覽器 TLS/JA3 指紋，可繞過多數 Cloudflare 等
+         「基本防護」（僅檢查請求指紋、不需執行 JavaScript 的防護）
+      3. Playwright：啟動真實無頭瀏覽器渲染頁面，可通過需要執行 JavaScript
+         的進階防護（例如 JS 驗證挑戰），但速度較慢、資源消耗較大
+    """
+    # 方式一：一般 requests
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         if resp.status_code == 200:
@@ -172,6 +215,7 @@ def _fetch_page_html(url):
     except Exception as e:
         print(f"[INFO] requests 抓取 {url} 失敗（{e}），改嘗試 curl_cffi", file=sys.stderr)
 
+    # 方式二：curl_cffi 偽裝瀏覽器指紋
     try:
         from curl_cffi import requests as curl_requests
         resp = curl_requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=20)
@@ -181,6 +225,7 @@ def _fetch_page_html(url):
     except Exception as e:
         print(f"[INFO] curl_cffi 抓取 {url} 失敗（{e}），改嘗試 Playwright", file=sys.stderr)
 
+    # 方式三：Playwright 實際渲染頁面
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
@@ -272,7 +317,10 @@ def parse_yuenan_listing(html, base_url, source_name):
 
 
 def parse_generic_listing(soup, source):
-    """通用 HTML 解析邏輯（適用於未指定專屬 parser 的來源）。"""
+    """通用 HTML 解析邏輯（適用於未指定專屬 parser 的來源）。
+    item_selector / title_selector / link_selector 為 CSS selector，
+    實際 HTML 結構會隨網站改版而變動，部署前請打開瀏覽器「檢查元素」確認。
+    """
     items = []
     nodes = soup.select(source["item_selector"])
     for node in nodes:
@@ -302,6 +350,10 @@ def parse_generic_listing(soup, source):
 
 
 def fetch_html(source):
+    """取得新聞列表頁 HTML 並解析。
+    無法取得精確發布時間時，published 設為 None，
+    後續會改用容錯邏輯保留該筆讓 Gemini 依內容判斷。
+    """
     items = []
     html_content, method_used = _fetch_page_html(source["list_url"])
     if html_content is None:
@@ -320,6 +372,8 @@ def fetch_html(source):
         return items
 
     if len(items) == 0:
+        # 頁面成功取得，但解析不到任何項目，代表網頁結構與目前解析邏輯不符。
+        # 印出頁面片段方便直接從 log 除錯，不需要另外用瀏覽器「檢查元素」。
         print(
             f"[WARN] {source['name']} 頁面成功取得，但解析到 0 筆，"
             f"可能是網頁結構與目前的解析邏輯不符。",
@@ -331,8 +385,11 @@ def fetch_html(source):
 
 
 def _debug_dump_html_snippet(source_name, soup):
+    """印出頁面中「看起來像新聞連結」的候選元素，協助判斷正確的 CSS selector。"""
     print(f"[DEBUG] ===== {source_name} 頁面結構除錯資訊開始 =====", file=sys.stderr)
 
+    # 印出所有帶連結文字看起來像新聞標題的 <a> 標籤（文字長度 > 8 個字），
+    # 並附上該 <a> 標籤往上兩層的父層標籤名稱與 class，方便推斷 item_selector。
     candidate_links = [a for a in soup.find_all("a") if a.get_text(strip=True) and len(a.get_text(strip=True)) > 8]
     print(f"[DEBUG] 頁面中共找到 {len(soup.find_all('a'))} 個 <a> 標籤，"
           f"其中文字長度 > 8 的有 {len(candidate_links)} 個，列出前 15 個：", file=sys.stderr)
@@ -350,6 +407,7 @@ def _debug_dump_html_snippet(source_name, soup):
 
 
 def try_parse_time(text):
+    """嘗試解析常見中文/數字時間格式，失敗回傳 None。"""
     from dateutil import parser as dateparser
     try:
         dt = dateparser.parse(text, fuzzy=True)
@@ -362,6 +420,40 @@ def try_parse_time(text):
     return None
 
 
+def enrich_yuenan_published_times(items):
+    """針對任何連結指向 yuenan.com、但目前抓不到精確發布時間的項目，
+    進一步造訪該篇文章的內頁，讀取標準格式的發布時間標籤：
+        <time class="entry-date published" datetime="2026-08-14T17:08:03+07:00">
+    這個時間戳精確到秒且含時區，比列表頁「2小时前」這類相對時間可靠許多，
+    可用來補強／取代原本解析失敗或不精確的時間。
+    此函式會直接修改傳入 items 中符合條件項目的 "published" 欄位。
+    """
+    targets = [it for it in items if "yuenan.com" in it["link"] and it.get("published") is None]
+    if not targets:
+        return
+
+    print(f"[INFO] 針對 {len(targets)} 筆 yuenan.com 文章嘗試從文章內頁取得精確發布時間", file=sys.stderr)
+    success_count = 0
+    for it in targets:
+        html_content, _method = _fetch_page_html(it["link"])
+        if html_content is None:
+            continue
+        try:
+            soup = BeautifulSoup(html_content, "html.parser")
+            time_el = soup.select_one("time.entry-date.published") or soup.select_one("time.published")
+            if time_el:
+                dt_str = time_el.get("datetime")
+                if dt_str:
+                    dt = datetime.fromisoformat(dt_str)
+                    it["published"] = dt.astimezone(VN_TZ)
+                    success_count += 1
+        except Exception as e:
+            print(f"[WARN] 解析文章內頁時間失敗 ({it['link']}): {e}", file=sys.stderr)
+        time.sleep(1)  # 禮貌性間隔
+
+    print(f"[INFO] 成功補齊 {success_count}/{len(targets)} 筆 yuenan.com 精確發布時間", file=sys.stderr)
+
+
 def collect_all_items():
     all_items = []
     source_counts = []
@@ -372,7 +464,7 @@ def collect_all_items():
             fetched = fetch_html(source)
         source_counts.append((source["name"], len(fetched)))
         all_items.extend(fetched)
-        time.sleep(1)
+        time.sleep(1)  # 禮貌性間隔，避免對來源網站造成負擔
 
     print("[INFO] ===== 各來源抓取筆數 =====", file=sys.stderr)
     for name, count in source_counts:
@@ -381,6 +473,10 @@ def collect_all_items():
 
     return all_items
 
+
+# ---------------------------------------------------------------------------
+# 時間篩選：越南時間前一日 07:00:00 ~ 當日 06:59:59
+# ---------------------------------------------------------------------------
 
 def get_time_window(now_vn):
     end = now_vn.replace(hour=6, minute=59, second=59, microsecond=0)
@@ -394,15 +490,29 @@ def get_time_window(now_vn):
 
 def filter_by_time(items, start, end):
     filtered = []
+    matched_by_time = 0
+    kept_without_time = 0
     for item in items:
         pub = item.get("published")
         if pub is None:
+            # 抓不到精確發布時間的來源，先保留讓 Gemini 依內容判斷是否為近期新聞。
             filtered.append(item)
+            kept_without_time += 1
             continue
         if start <= pub <= end:
             filtered.append(item)
+            matched_by_time += 1
+    print(
+        f"[INFO] 時間篩選明細：{matched_by_time} 筆時間落在區間內、"
+        f"{kept_without_time} 筆因缺少精確時間被容錯保留",
+        file=sys.stderr,
+    )
     return filtered
 
+
+# ---------------------------------------------------------------------------
+# 去重（第一階段：網址去重）
+# ---------------------------------------------------------------------------
 
 def dedupe_by_url(items):
     seen = set()
@@ -415,6 +525,12 @@ def dedupe_by_url(items):
         result.append(item)
     return result
 
+
+# ---------------------------------------------------------------------------
+# 去重（第二階段：Gemini 語意去重）
+# 多個來源（原始網站 + Google News 轉載 + 不同媒體報導同一事件）常出現
+# 標題文字不同、但描述同一則新聞的情況，用語意判斷合併只保留一則。
+# ---------------------------------------------------------------------------
 
 def _clean_json_block(text):
     return re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
@@ -443,6 +559,9 @@ def build_dedupe_prompt(items):
 
 
 def semantic_dedupe(items, api_key):
+    """用 Gemini 對整批新聞做語意去重，回傳去重後的清單。
+    若 API 呼叫失敗，為避免整批資料流失，退回直接使用網址去重的結果。
+    """
     if len(items) <= 1:
         return items
 
@@ -466,6 +585,8 @@ def semantic_dedupe(items, api_key):
         valid_indices = sorted({i - 1 for i in group if isinstance(i, int) and 1 <= i <= len(items)})
         if len(valid_indices) < 2:
             continue
+        # 保留規則：優先保留「非 Google News 轉載」的原始出處；
+        # 若組內都是轉載或都非轉載，則保留清單中最先出現的一筆。
         keep_idx = None
         for idx in valid_indices:
             if "Google News 轉載" not in items[idx]["source"]:
@@ -482,20 +603,49 @@ def semantic_dedupe(items, api_key):
     return deduped
 
 
+# ---------------------------------------------------------------------------
+# Gemini API：批次翻譯 + 分類
+# ---------------------------------------------------------------------------
+
 CATEGORY_RULES = """
-【01 政治】越南黨政高層動態（國家主席蘇林、總理黎明興、國會主席陳青敏、外交部長黎懷中、
-公安部長梁三光、國防部長潘文江）之出訪/接待外賓/人事異動/紀律處分；外國專家對越南政治之評論；
-中國駐越南大使在越南之活動；寮國黨政高層動態、出訪與接待。
+【01 政治】僅限：
+- 越南黨政高層（國家主席蘇林、總理黎明興、國會主席陳青敏、外交部長黎懷中、
+  公安部長梁三光、國防部長潘文江）本人之出訪、接待外賓、國是訪問、國際會議、
+  聯合聲明；或上述層級的人事任命／調查／紀律處分。
+- 外國專家學者「公開發表對越南政治情勢」之評論（須為政治評論，非泛泛提及越南）。
+- 中國駐越南大使在越南的正式活動。
+- 寮國黨政高層本人的動態、出訪、接待外賓。
 
-【02 經濟】越南重要經濟政策、總體經濟數據（進出口、貿易順逆差、車市銷售）；越南與外國之經濟合作
-與論壇；越南政府重大經濟投資（交通/半導體/高科技）；越南重要公司、台商、國際廠商在越投資動態；
-外國專家對越南經濟之評論；寮國重大經濟政策。
+【02 經濟】僅限：
+- 越南「全國性」經濟政策發布、官方總體經濟數據（進出口總額、貿易順逆差、車市銷售等統計數字）。
+- 越南與外國之間的官方經濟合作宣示、論壇、協議。
+- 越南政府主導的重大經濟建設投資（交通建設、半導體、高科技園區等指標型計畫）。
+- 具名的知名公司、台商或國際廠商在越南的重大投資新聞（須為具體投資金額或計畫，非一般商業活動）。
+- 外國專家學者「公開發表對越南經濟情勢」之評論。
+- 寮國全國性重大經濟政策。
 
-【03 其他】越南重大民生新聞、涉及外國人新規定或全國關注事件；台越雙邊重要新聞（航線開通/取消、
-重大災難、刑事案件）；越南勞工赴台相關重要新聞；越南舉辦之國際文教/體育活動或重大成就；
-寮國全國矚目事件，或涉及台灣人之詐騙、犯罪及刑事案件。
+【03 其他】僅限：
+- 越南「全國性、影響廣泛」的民生新聞，或明確針對「外國人」的新規定（例如簽證政策變動）。
+- 台灣與越南之間的具體雙邊事件：航線開通或取消、造成人員傷亡的重大災難、
+  涉及台灣人的刑事案件（反之亦然）。
+- 越南勞工赴台的重要新聞：需社會矚目、官方新規定、或涉及官員貪腐等具體事件。
+- 越南主辦的「國際級」文化／藝術／體育競賽或活動，或越南人在國際上取得的重大成就
+  （須為國際級，非地方性活動）。
+- 寮國「全國矚目」的重大事件。
+- 寮國境內涉及台灣人的詐騙、犯罪、刑事案件。
 
-若新聞內容與越南、寮國均無明顯關聯，或明顯與上述三類主題都不符，請回傳 category 為 "discard"。
+【嚴格排除（一律 discard）】：
+- 單一地方性意外或事故，且未達重大傷亡規模（例如單一住宅火災、單一死亡個案，
+  除非明確符合上方「重大災難」條件）。
+- 一般地方治安新聞、單一刑事案件，但未涉及台灣人或外國人。
+- 日常生活趣聞、動物闖入店家、地方奇聞軼事。
+- 單一醫院、單一機構的例行性業務紀錄或成就（例如手術例數統計、機構內部公告），
+  除非達到全國性重大意義。
+- 地方性文化活動、非國際級的紀念活動或集會。
+- 僅因新聞「發生在越南或寮國」、或「提到越南、寮國」就視為相關——這不是納入的理由，
+  必須同時符合上方某一類別的「具體條件」才能納入。
+
+判斷原則：寧可從嚴（不確定時 discard），不要因為新聞主題與越南／寮國沾上邊就納入。
 """
 
 
@@ -504,10 +654,14 @@ def build_classify_prompt(batch):
         f'{i+1}. 標題原文：「{it["title"]}」（來源：{it["source"]}）'
         for i, it in enumerate(batch)
     )
-    return f"""你是一個新聞編輯助理，請針對以下每一則新聞，完成兩件事：
+    return f"""你是一個嚴格的新聞編輯，任務是「篩選出真正重要、高度符合規則的新聞」，
+而不是廣泛收錄任何與越南、寮國相關的內容。請針對以下每一則新聞，完成兩件事：
+
 (a) 將標題翻譯／轉寫為「繁體中文」，語氣維持新聞標題的簡潔客觀風格；
-(b) 依照下列分類規則，判斷這則新聞屬於 "01"（政治）、"02"（經濟）、"03"（其他），
-    若都不符合則歸類為 "discard"。
+(b) 嚴格依照下列分類規則判斷這則新聞屬於 "01"（政治）、"02"（經濟）、"03"（其他）中的哪一類。
+    只有當新聞內容「明確且具體符合」該類別條件時才歸類；如果只是主題沾邊、
+    或屬於規則中列出的「嚴格排除」項目，一律歸類為 "discard"。
+    不確定時，一律選擇 "discard"（寧可漏收，不要多收）。
 
 分類規則：
 {CATEGORY_RULES}
@@ -523,6 +677,7 @@ def build_classify_prompt(batch):
 
 
 def call_gemini_classify_batch(batch, api_key):
+    """呼叫 Gemini API 進行批次翻譯與分類，回傳 dict: index -> {title_zh, category}"""
     from google import genai
 
     client = genai.Client(api_key=api_key)
@@ -548,6 +703,7 @@ def call_gemini_classify_batch(batch, api_key):
 
 
 def classify_and_translate(items, api_key, batch_size=15):
+    """將 items 分批送入 Gemini，回傳篩選/翻譯/分類後的新聞清單。"""
     output = []
     for i in range(0, len(items), batch_size):
         batch = items[i:i + batch_size]
@@ -565,9 +721,13 @@ def classify_and_translate(items, api_key, batch_size=15):
                 "category": info["category"],
                 "published": item["published"].isoformat() if item.get("published") else None,
             })
-        time.sleep(1)
+        time.sleep(1)  # 批次間稍作停頓，降低 API 速率限制風險
     return output
 
+
+# ---------------------------------------------------------------------------
+# 輸出
+# ---------------------------------------------------------------------------
 
 def write_daily_json(target_date: date, news_items, generated_at_vn):
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -621,6 +781,10 @@ def update_index(target_date: date):
     print(f"[INFO] 已更新 index.json，目前共 {len(dates)} 個日期，最新日期：{dates[-1]}")
 
 
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+
 def main():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -636,6 +800,8 @@ def main():
 
     raw_items = collect_all_items()
     print(f"[INFO] 抓取到原始新聞筆數: {len(raw_items)}")
+
+    enrich_yuenan_published_times(raw_items)
 
     time_filtered = filter_by_time(raw_items, start, end)
     print(f"[INFO] 時間篩選後筆數: {len(time_filtered)}")

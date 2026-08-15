@@ -822,15 +822,6 @@ def dedupe_by_url(items):
 # 標題文字不同、但描述同一則新聞的情況，用語意判斷合併只保留一則。
 # ---------------------------------------------------------------------------
 
-def _format_time_for_prompt(published_dt):
-    """將 datetime 格式化為 prompt 中易讀的文字，讓 Gemini 能判斷新舊。
-    時間未知時明確標示「未知」，而非留空或顯示 None，避免模型誤判。
-    """
-    if published_dt is None:
-        return "未知"
-    return published_dt.strftime("%Y-%m-%d %H:%M")
-
-
 def _clean_json_block(text):
     return re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
 
@@ -952,43 +943,25 @@ CATEGORY_RULES = """
 """
 
 
-def build_combined_prompt(items):
+def build_classify_prompt(items):
     numbered = "\n".join(
-        f'{i+1}. 「{it["title"]}」（來源：{it["source"]}；發布時間：{_format_time_for_prompt(it.get("published"))}）'
+        f'{i+1}. 「{it["title"]}」（來源：{it["source"]}）'
         for i, it in enumerate(items)
     )
-    return f"""你是一位外交部新聞資訊編輯，請對以下新聞清單依序完成三項任務。
+    return f"""你是一位外交部新聞資訊編輯，請對以下新聞清單依序完成兩項任務。
 清單可能有數十則之多，請逐一仔細判斷每一則，不要因為清單較長就簡化或跳過判斷邏輯——
-去重比對、翻譯品質、分類準確度都必須維持一致的嚴謹程度，不因項目數量而打折扣。
+翻譯品質、分類準確度都必須維持一致的嚴謹程度，不因項目數量而打折扣。
 
-【任務一：去重】找出所有屬於「重複內容」的報導，包含兩種情況都算重複：
-(a) 描述同一則具體新聞事件，只是不同媒體轉載或標題用詞不同；
-(b) 描述「同一個持續性主題或系列進展」，核心議題高度重疊，僅報導角度、細節或
-    統計數字略有不同（例如同一機場的無人機／風箏干擾問題被多次以不同標題報導、
-    同一事件的後續追蹤報導）。
-若是各自獨立、具有不同具體資訊的個別事件（例如不同地點、不同日期發生的不同意外），
-則不算重複，應個別保留，不要過度合併。
-
-每組重複項目只保留一則代表性項目，保留優先順序如下（由高到低）：
-(1) 若該組中有任何一則來源為「中央通訊社」（CNA）的報導，一律優先保留該則；
-(2) 若無中央社來源，優先保留「發布時間最新」的一則（每則新聞後方已標註發布時間，
-    時間未知的視為最舊，優先順序最低）；
-(3) 若以上條件仍無法區分（例如時間相同或都未知），優先保留非「Google News 轉載」
-    的原始出處；
-(4) 若以上條件皆無法區分，保留編號最小的一則。
-不確定是否重複時，不要視為重複（寧可漏判，不要誤判）。
-
-【任務二：翻譯】針對「保留下來」的每一則新聞，將標題轉寫為「繁體中文」（台灣慣用字形），
+【任務一：翻譯】針對每一則新聞，將標題轉寫為「繁體中文」（台灣慣用字形），
 語氣維持新聞標題的簡潔客觀風格。特別注意：若新聞來源本身已是簡體中文（例如部分中國大陸
 或越南中文媒體慣用簡體字），仍必須逐字轉換為繁體中文（例如：国→國、这→這、说→說、
 们→們、报→報），不可因為原文「已經是中文」就直接原樣保留簡體字。所有輸出的 title_zh
 一律不得含有任何簡體字。
 
-【任務三：分類】任務是從中篩選出「對台灣、越南、寮國外交部門具有參考價值」的新聞——
+【任務二：分類】任務是從中篩選出「對台灣、越南、寮國外交部門具有參考價值」的新聞——
 包括外交互動、經貿政策、供應鏈地緣政治、領事僑務保護等面向，而不是只挑選規模最大的頭條。
-依照下列分類規則，將每則「保留下來」的新聞歸類為 "01"（政治）、"02"（經濟）、
-"03"（其他）其中之一。若屬於純地方生活瑣事、與外交／經貿／領事事務無明顯關聯，
-歸類為 "discard"。
+依照下列分類規則，將每則新聞歸類為 "01"（政治）、"02"（經濟）、"03"（其他）其中之一。
+若屬於純地方生活瑣事、與外交／經貿／領事事務無明顯關聯，歸類為 "discard"。
 
 分類規則：
 {CATEGORY_RULES}
@@ -997,14 +970,14 @@ def build_combined_prompt(items):
 {numbered}
 
 請「只」回傳一個 JSON 陣列，不要加入任何說明文字或 Markdown 語法（不要用 ```json 包裹）。
-陣列只需包含「去重後保留、且分類不為 discard」的項目，格式為：
+陣列只需包含「分類不為 discard」的項目，格式為：
 {{"index": 原始編號(數字), "title_zh": "翻譯後的繁體中文標題", "category": "01/02/03"}}
 """
 
 
-def dedupe_translate_classify(items, api_key):
-    """單一 Gemini 呼叫同時完成：語意去重、標題翻譯、分類。
-    回傳最終應寫入摘要檔的新聞清單。
+def classify_and_translate_batches(items, api_key):
+    """分批將新聞送入 Gemini 完成翻譯與分類（此階段不做去重）。
+    回傳翻譯分類後保留的新聞清單。
     """
     if not items:
         return []
@@ -1012,7 +985,7 @@ def dedupe_translate_classify(items, api_key):
     output = []
     for i in range(0, len(items), DEDUPE_CLASSIFY_BATCH_SIZE):
         batch = items[i:i + DEDUPE_CLASSIFY_BATCH_SIZE]
-        prompt = build_combined_prompt(batch)
+        prompt = build_classify_prompt(batch)
         raw_text = _call_gemini_with_retry(prompt, api_key)
 
         if raw_text is None:
@@ -1049,6 +1022,118 @@ def dedupe_translate_classify(items, api_key):
             })
 
     return output
+
+
+# ---------------------------------------------------------------------------
+# Gemini API：最終全域去重（單一次呼叫，在翻譯分類「之後」執行）
+# ---------------------------------------------------------------------------
+#
+# 重要設計調整：先前版本把去重跟翻譯分類合併在同一批次的同一次呼叫中，
+# 但當新聞筆數超過 DEDUPE_CLASSIFY_BATCH_SIZE、需要拆成多個批次時，
+# Gemini 在做去重比對時「只看得到自己那一批次的內容」，看不到其他批次——
+# 導致同一則新聞若恰好被分派到不同批次，就完全比對不到，去重失效。
+#
+# 修正做法：去重改到翻譯分類「之後」、以「單一次呼叫」對全部存活下來的
+# 新聞（通常已從兩三百筆篩到僅剩數十筆）做一次全域比對，確保去重時
+# 一定能看到完整名單，不會再有跨批次看不到彼此的問題。
+
+def _is_cna_source(source_name):
+    """判斷來源名稱是否為中央通訊社（CNA），需同時涵蓋直接標註「中央通訊社」
+    以及透過 Google News 轉載時可能只顯示網域名稱「cna.com.tw」的情況。
+    """
+    return "中央通訊社" in source_name or "cna" in source_name.lower()
+
+
+def build_final_dedupe_prompt(items):
+    numbered = "\n".join(
+        f'{i+1}. 「{it["title"]}」（來源：{it["source"]}；發布時間：'
+        f'{it["published"] if it.get("published") else "未知"}）'
+        for i, it in enumerate(items)
+    )
+    return f"""以下是今天已完成翻譯與分類的新聞清單，其中可能包含重複內容，包含兩種情況都算重複：
+(a) 描述同一則具體新聞事件，只是不同媒體轉載或標題用詞不同；
+(b) 描述「同一個持續性主題或系列進展」，核心議題高度重疊，僅報導角度、細節或
+    統計數字略有不同（例如同一機場的無人機／風箏干擾問題被多次以不同標題報導、
+    同一事件的後續追蹤報導）。
+若是各自獨立、具有不同具體資訊的個別事件（例如不同地點、不同日期發生的不同意外），
+則不算重複，應個別保留，不要過度合併。不確定是否重複時，不要視為重複（寧可漏判，不要誤判）。
+
+請找出所有重複項目並將編號分組。
+
+新聞清單：
+{numbered}
+
+請「只」回傳一個 JSON 物件，不要加入任何說明文字或 Markdown 語法，格式如下：
+{{"duplicate_groups": [[編號, 編號, ...], [編號, 編號, ...]]}}
+只需列出「有重複」的分組（每組至少 2 個編號），沒有重複的項目不必列出。
+若完全沒有重複項目，回傳 {{"duplicate_groups": []}}。
+"""
+
+
+def final_dedupe(items, api_key):
+    """對翻譯分類後的完整名單做單一次全域去重。
+    找出重複分組後，保留規則由程式碼直接判斷（而非完全交給 Gemini 排序），
+    確保優先順序被精確套用，優先順序如下（由高到低）：
+    (1) 中央通訊社（CNA）來源；(2) 發布時間最新；(3) 非 Google News 轉載的
+    原始出處；(4) 編號最小者。
+    若 API 呼叫失敗，為避免整批資料流失，直接回傳原始清單（不去重但保留全部資料）。
+    """
+    if len(items) <= 1:
+        return items
+
+    prompt = build_final_dedupe_prompt(items)
+    raw_text = _call_gemini_with_retry(prompt, api_key)
+
+    if raw_text is None:
+        print("[WARN] 最終去重呼叫失敗，本次略過去重（新聞可能包含重複項目）", file=sys.stderr)
+        return items
+
+    try:
+        parsed = json.loads(_clean_json_block(raw_text))
+        groups = parsed.get("duplicate_groups", [])
+    except Exception as e:
+        print(f"[WARN] 最終去重回傳內容解析失敗，本次略過去重: {e}", file=sys.stderr)
+        return items
+
+    to_remove = set()
+    for group in groups:
+        valid_indices = sorted({i - 1 for i in group if isinstance(i, int) and 1 <= i <= len(items)})
+        if len(valid_indices) < 2:
+            continue
+
+        keep_idx = None
+
+        # 優先順序 (1)：中央通訊社來源
+        for idx in valid_indices:
+            if _is_cna_source(items[idx]["source"]):
+                keep_idx = idx
+                break
+
+        # 優先順序 (2)：發布時間最新
+        if keep_idx is None:
+            dated = [(idx, items[idx]["published"]) for idx in valid_indices if items[idx].get("published")]
+            if dated:
+                dated.sort(key=lambda pair: pair[1], reverse=True)
+                keep_idx = dated[0][0]
+
+        # 優先順序 (3)：非 Google News 轉載的原始出處
+        if keep_idx is None:
+            for idx in valid_indices:
+                if "Google News 轉載" not in items[idx]["source"]:
+                    keep_idx = idx
+                    break
+
+        # 優先順序 (4)：編號最小者
+        if keep_idx is None:
+            keep_idx = valid_indices[0]
+
+        for idx in valid_indices:
+            if idx != keep_idx:
+                to_remove.add(idx)
+
+    deduped = [item for i, item in enumerate(items) if i not in to_remove]
+    print(f"[INFO] 最終全域去重：{len(items)} 筆 → {len(deduped)} 筆（移除 {len(to_remove)} 筆重複報導）")
+    return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -1138,10 +1223,12 @@ def main():
     if not url_deduped:
         print("[INFO] 本次無符合時間區間之新聞，仍會輸出空白摘要檔以維持前端日期可查。")
 
-    classified = dedupe_translate_classify(url_deduped, api_key)
-    print(f"[INFO] Gemini 去重＋分類後保留筆數: {len(classified)}")
+    classified = classify_and_translate_batches(url_deduped, api_key)
+    print(f"[INFO] Gemini 翻譯＋分類後保留筆數: {len(classified)}")
 
-    write_daily_json(target_date, classified, now_vn)
+    final_items = final_dedupe(classified, api_key)
+
+    write_daily_json(target_date, final_items, now_vn)
     update_index(target_date)
 
 

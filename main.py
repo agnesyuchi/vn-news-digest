@@ -229,12 +229,17 @@ def _fetch_page_html(url):
         print(f"[INFO] curl_cffi 抓取 {url} 失敗（{e}），改嘗試 Playwright", file=sys.stderr)
 
     # 方式三：Playwright 實際渲染頁面
+    # 注意：wait_until 使用 "domcontentloaded" 而非 "networkidle"。
+    # networkidle 要求頁面「完全沒有背景網路活動」才視為載入完成，
+    # 但真實網站常有廣告/追蹤碼持續發送零星請求，導致這個條件幾乎等不到，
+    # 每次都會硬等滿逾時時間（非常慢）。我們需要的內容是伺服器端渲染好的
+    # 靜態 HTML，domcontentloaded（主要內容載入完成）已經足夠。
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(user_agent=HEADERS["User-Agent"])
-            page.goto(url, timeout=30000, wait_until="networkidle")
+            page.goto(url, timeout=15000, wait_until="domcontentloaded")
             html = page.content()
             browser.close()
             return html, "playwright"
@@ -490,18 +495,34 @@ def enrich_yuenan_published_times(items):
             f"[INFO] {len(needs_playwright)} 篇文章需改用 Playwright（將共用同一瀏覽器實例依序處理）",
             file=sys.stderr,
         )
+        consecutive_failures = 0
+        max_consecutive_failures = 5  # 連續失敗達此次數，視為該網站本次不可用，提前放棄剩餘項目
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page(user_agent=HEADERS["User-Agent"])
                 for it in needs_playwright:
+                    if consecutive_failures >= max_consecutive_failures:
+                        print(
+                            f"[WARN] 已連續 {max_consecutive_failures} 篇 Playwright 抓取失敗，"
+                            f"判斷網站本次暫時無法存取，提前放棄剩餘 "
+                            f"{len(needs_playwright) - needs_playwright.index(it)} 篇（避免無謂等待）",
+                            file=sys.stderr,
+                        )
+                        break
                     try:
-                        page.goto(it["link"], timeout=30000, wait_until="networkidle")
+                        # 同 _fetch_page_html：改用 domcontentloaded 避免 networkidle
+                        # 因背景雜訊請求而幾乎必定逾時的問題，並縮短單頁逾時時間。
+                        page.goto(it["link"], timeout=15000, wait_until="domcontentloaded")
                         if _apply_yuenan_published_time(it, page.content()):
                             success_count += 1
+                            consecutive_failures = 0
+                        else:
+                            consecutive_failures += 1
                     except Exception as e:
                         print(f"[WARN] Playwright 抓取文章內頁失敗 ({it['link']}): {e}", file=sys.stderr)
+                        consecutive_failures += 1
                 browser.close()
         except Exception as e:
             print(f"[WARN] Playwright 初始化失敗，剩餘文章無法補齊精確時間: {e}", file=sys.stderr)

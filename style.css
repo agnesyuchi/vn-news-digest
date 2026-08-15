@@ -1,26 +1,30 @@
 /* ============================================================
    越寮觀察 — 每日新聞摘要
-   設計主題：東南亞漆器工藝（sơn mài）— 深漆綠底 + 金線 + 硃紅印章
+   設計主題：霜色與夜港 — 深藍炭灰夜色 + 銅金點綴 + 冰霜淺藍晨光
+   淺色/深色模式共享同一組炭灰／冰藍錨點色，銅金作為兩種模式下
+   共通的畫龍點睛元素。
    ============================================================ */
 
 @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@500;700&family=Noto+Sans+TC:wght@400;500;600&display=swap');
 
 :root {
-  --color-lacquer: #14231F;
-  --color-lacquer-raised: #1B2E28;
-  --color-parchment: #EDE6D6;
-  --color-parchment-muted: #C9C0AC;
-  --color-gold: #C89B3C;
-  --color-gold-dim: #8A6E2E;
-  --color-vermilion: #A63A2E;
-  --color-jade: #4F7A5B;
-  --color-sand: #B79C6B;
+  --color-ink: #36454F;
+  --color-ink-raised: #40515C;
+  --color-frost: #EBFAFF;
+  --color-frost-soft: #D9EEF5;
+  --color-frost-muted: #9FB4BE;
+  --color-brass: #C9A24B;
+  --color-brass-dim: #8E7038;
+  --color-vermilion: #D0715F;
+  --color-jade: #5FA189;
+  --color-sand: #C7AD7C;
+  --color-badge-ink: #20282C;
 
-  --bg-page: var(--color-lacquer);
-  --bg-raised: var(--color-lacquer-raised);
-  --text-primary: var(--color-parchment);
-  --text-secondary: var(--color-parchment-muted);
-  --border-hairline: rgba(200, 155, 60, 0.22);
+  --bg-page: var(--color-ink);
+  --bg-raised: var(--color-ink-raised);
+  --text-primary: var(--color-frost-soft);
+  --text-secondary: var(--color-frost-muted);
+  --border-hairline: rgba(235, 250, 255, 0.14);
 
   --font-display: 'Noto Serif TC', serif;
   --font-body: 'Noto Sans TC', sans-serif;
@@ -31,11 +35,17 @@
 }
 
 html[data-theme="light"] {
-  --bg-page: var(--color-parchment);
-  --bg-raised: #F7F2E6;
-  --text-primary: #23261F;
-  --text-secondary: #5B5646;
-  --border-hairline: rgba(90, 60, 20, 0.18);
+  --bg-page: #EBFAFF;
+  --bg-raised: #FFFFFF;
+  --text-primary: #36454F;
+  --text-secondary: #5C707A;
+  --border-hairline: rgba(54, 69, 79, 0.14);
+  --color-brass: #A9822F;
+  --color-brass-dim: #6E5522;
+  --color-vermilion: #A63A2E;
+  --color-jade: #3F7D6B;
+  --color-sand: #816540;
+  --color-badge-ink: #F5FAFC;
   color-scheme: light;
 }
 
@@ -82,7 +92,7 @@ body {
   font-weight: 700;
   font-size: clamp(1.5rem, 4vw, 2.1rem);
   margin: 0;
-  color: var(--color-gold);
+  color: var(--color-brass);
   letter-spacing: 0.02em;
 }
 
@@ -110,12 +120,12 @@ body {
 }
 
 #theme-toggle:hover {
-  border-color: var(--color-gold);
+  border-color: var(--color-brass);
   transform: rotate(15deg);
 }
 
 #theme-toggle:focus-visible {
-  outline: 2px solid var(--color-gold);
+  outline: 2px solid var(--color-brass);
   outline-offset: 2px;
 }
 
@@ -136,7 +146,7 @@ body {
   border: 2px solid var(--color-vermilion);
   border-radius: 999px;
   padding: 0.4rem 1rem;
-  background: rgba(166, 58, 46, 0.08);
+  background: color-mix(in srgb, var(--color-vermilion) 10%, transparent);
 }
 
 .date-seal .seal-icon {
@@ -250,7 +260,7 @@ main {
   font-family: var(--font-mono);
   font-size: 0.75rem;
   font-weight: 700;
-  color: var(--bg-page);
+  color: var(--color-badge-ink);
 }
 
 .cat-political .cat-badge { background: var(--color-vermilion); }
@@ -280,7 +290,7 @@ main {
 
 .news-card:hover {
   transform: translateX(3px);
-  border-color: var(--color-gold);
+  border-color: var(--color-brass);
 }
 
 .news-card a {
@@ -291,7 +301,7 @@ main {
 }
 
 .news-card a:focus-visible {
-  outline: 2px solid var(--color-gold);
+  outline: 2px solid var(--color-brass);
   outline-offset: -2px;
 }
 
@@ -328,5 +338,5 @@ footer {
 }
 
 footer a {
-  color: var(--color-gold);
+  color: var(--color-brass);
 }

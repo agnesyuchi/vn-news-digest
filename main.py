@@ -58,39 +58,23 @@ HEADERS = {
 # 關鍵字（用於 Google News RSS 搜尋）
 KEYWORDS = ["越南", "寮國"]
 
-# ---------------------------------------------------------------------------
-# 資料來源設定
-# ---------------------------------------------------------------------------
-# type = "rss"  : 直接用 feedparser 解析
-# type = "html" : 用「curl_cffi 偽裝瀏覽器指紋 → Playwright 實際渲染」兩階段方式取得頁面，
-#                 再用 BeautifulSoup 解析。
-#                 item_selector / title_selector / link_selector 為 CSS selector，
-#                 實際 HTML 結構會隨網站改版而變動，部署前請打開瀏覽器「檢查元素」確認。
-
 SOURCES = [
     {
         "name": "越南投資 (yuenan.com)",
         "type": "html",
         "list_url": "https://yuenan.com/news/",
-        "item_selector": "article, .post, .news-item",
-        "title_selector": "h2, h3, .entry-title",
-        "link_selector": "a",
-        "time_selector": "time, .date, .post-date",
+        # 此來源改用專屬解析邏輯（見 parse_yuenan_listing），
+        # 因為 item-title 與 item-meta 是「兄弟節點」而非巢狀結構，
+        # 不適合套用下方通用的 item_selector/title_selector 模式。
+        "parser": "yuenan",
     },
     {
         "name": "VietnamPlus 中文網",
         "type": "rss",
-        # VietnamPlus 多語版通常提供 RSS，實際路徑請以官網公告為準，
-        # 若中文版無獨立 RSS，可改用其英文/越南文版 RSS 後仍以標題原文送入 Gemini 翻譯。
         "feed_url": "https://zh.vietnamplus.vn/rss/home.rss",
     },
-    # 中央通訊社 (CNA) 官方站內搜尋頁為前端 JavaScript 動態載入結果，
-    # 不適合直接爬取（搜尋網址也常隨改版變動），改用下方「Google News 站內搜尋」取得。
 ]
 
-# Google News RSS：依關鍵字動態組出搜尋 RSS 網址
-# 除了關鍵字全站搜尋，也加入「site: 限定網域」查詢，作為 yuenan.com、CNA、
-# VietnamPlus 等來源在直接爬蟲失敗時的可靠替代管道。
 SITE_RESTRICTED_SOURCES = [
     ("yuenan.com", "越南投資"),
     ("cna.com.tw", "中央通訊社 CNA"),
@@ -99,10 +83,6 @@ SITE_RESTRICTED_SOURCES = [
 
 
 def google_news_rss_sources():
-    """建立 Google News RSS 來源清單。
-    這些來源的每一則新聞，其「出處」會在 fetch_rss() 中依 RSS 內容
-    動態解析為實際發布媒體名稱，並統一標註為「XXX（Google News 轉載）」。
-    """
     sources = []
     for kw in KEYWORDS:
         sources.append({
@@ -127,16 +107,7 @@ def google_news_rss_sources():
     return sources
 
 
-# ---------------------------------------------------------------------------
-# 抓取函式：RSS
-# ---------------------------------------------------------------------------
-
 def _extract_google_news_origin(entry, fallback_title):
-    """從 Google News RSS 的單一 entry 中，盡量解析出實際發布媒體名稱。
-    優先讀取 RSS <source> 標籤；若無，退而求其次從標題常見的
-    「標題文字 - 媒體名稱」格式中取出結尾的媒體名稱。
-    回傳 (origin_name_or_None, title_without_suffix)
-    """
     origin = None
     src_field = getattr(entry, "source", None)
     if src_field:
@@ -150,7 +121,6 @@ def _extract_google_news_origin(entry, fallback_title):
         tail = tail.strip()
         if not origin and tail:
             origin = tail
-        # 若結尾片段與解析出的媒體名稱相符，視為標題自帶的來源標記，予以移除
         if origin and tail == origin:
             cleaned_title = head.strip()
 
@@ -158,7 +128,6 @@ def _extract_google_news_origin(entry, fallback_title):
 
 
 def fetch_rss(source):
-    """解析 RSS/Atom feed，回傳 [{title, link, published, source}, ...]"""
     items = []
     try:
         feed = feedparser.parse(source["feed_url"])
@@ -194,19 +163,7 @@ def fetch_rss(source):
     return items
 
 
-# ---------------------------------------------------------------------------
-# 抓取函式：HTML（含防爬蟲繞道機制）
-# ---------------------------------------------------------------------------
-
 def _fetch_page_html(url):
-    """依序嘗試三種方式取得頁面 HTML，回傳 (html_or_None, method_used)：
-      1. requests：最快，適用於沒有防爬蟲機制的網站
-      2. curl_cffi：偽裝瀏覽器 TLS/JA3 指紋，可繞過多數 Cloudflare 等
-         「基本防護」（僅檢查請求指紋、不需執行 JavaScript 的防護）
-      3. Playwright：啟動真實無頭瀏覽器渲染頁面，可通過需要執行 JavaScript
-         的進階防護（例如 JS 驗證挑戰），但速度較慢、資源消耗較大
-    """
-    # 方式一：一般 requests
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         if resp.status_code == 200:
@@ -215,7 +172,6 @@ def _fetch_page_html(url):
     except Exception as e:
         print(f"[INFO] requests 抓取 {url} 失敗（{e}），改嘗試 curl_cffi", file=sys.stderr)
 
-    # 方式二：curl_cffi 偽裝瀏覽器指紋
     try:
         from curl_cffi import requests as curl_requests
         resp = curl_requests.get(url, headers=HEADERS, impersonate="chrome124", timeout=20)
@@ -225,7 +181,6 @@ def _fetch_page_html(url):
     except Exception as e:
         print(f"[INFO] curl_cffi 抓取 {url} 失敗（{e}），改嘗試 Playwright", file=sys.stderr)
 
-    # 方式三：Playwright 實際渲染頁面
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
@@ -241,11 +196,112 @@ def _fetch_page_html(url):
     return None, None
 
 
-def fetch_html(source):
-    """取得新聞列表頁 HTML 並解析。
-    無法取得精確發布時間時，published 設為 None，
-    後續會改用容錯邏輯保留該筆讓 Gemini 依內容判斷。
+def _parse_relative_chinese_time(text, reference_dt):
+    """解析常見的中文相對時間文字（例如「2小时前」「3天前」「刚刚」「昨天」），
+    找不到對應格式時，退回一般日期格式解析（try_parse_time）。
     """
+    text = text.strip()
+    if text in ("刚刚", "剛剛"):
+        return reference_dt
+
+    m = re.match(r"(\d+)\s*分钟前", text) or re.match(r"(\d+)\s*分鐘前", text)
+    if m:
+        return reference_dt - timedelta(minutes=int(m.group(1)))
+
+    m = re.match(r"(\d+)\s*小时前", text) or re.match(r"(\d+)\s*小時前", text)
+    if m:
+        return reference_dt - timedelta(hours=int(m.group(1)))
+
+    m = re.match(r"(\d+)\s*天前", text)
+    if m:
+        return reference_dt - timedelta(days=int(m.group(1)))
+
+    if text in ("昨天",):
+        return reference_dt - timedelta(days=1)
+
+    return try_parse_time(text)
+
+
+def parse_yuenan_listing(html, base_url, source_name):
+    """越南投資 (yuenan.com) 專屬解析邏輯。
+    實際頁面結構（依使用者提供的頁面原始碼確認）：
+        <div class="item-content">
+            <h3 class="item-title"><a href="...">標題</a></h3>
+            <div class="item-excerpt">...</div>
+        </div>
+        <div class="item-meta">
+            ...
+            <span class="item-meta-li date">2小时前</span>
+            ...
+        </div>
+    item-content 與 item-meta 是「兄弟節點」，因此改用 find_next_sibling 取得對應的
+    item-meta，而非依賴不確定的外層容器 class 名稱。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    reference_dt = datetime.now(VN_TZ)
+    items = []
+
+    for h3 in soup.select("h3.item-title"):
+        a = h3.select_one("a")
+        if not a:
+            continue
+        title = a.get_text(strip=True)
+        link = a.get("href", "").strip()
+        if link and not link.startswith("http"):
+            link = urljoin(base_url, link)
+        if not title or not link:
+            continue
+
+        published_dt = None
+        item_content = h3.find_parent("div", class_="item-content")
+        if item_content:
+            item_meta = item_content.find_next_sibling("div", class_="item-meta")
+            if item_meta:
+                date_el = item_meta.select_one(".item-meta-li.date") or item_meta.select_one(".date")
+                if date_el:
+                    published_dt = _parse_relative_chinese_time(date_el.get_text(strip=True), reference_dt)
+
+        items.append({
+            "title": title,
+            "link": link,
+            "published": published_dt,
+            "source": source_name,
+        })
+
+    return items, soup
+
+
+def parse_generic_listing(soup, source):
+    """通用 HTML 解析邏輯（適用於未指定專屬 parser 的來源）。"""
+    items = []
+    nodes = soup.select(source["item_selector"])
+    for node in nodes:
+        title_el = node.select_one(source["title_selector"])
+        link_el = node.select_one(source["link_selector"])
+        if not title_el or not link_el:
+            continue
+        title = title_el.get_text(strip=True)
+        link = link_el.get("href", "").strip()
+        if link and not link.startswith("http"):
+            link = urljoin(source["list_url"], link)
+
+        published_dt = None
+        if source.get("time_selector"):
+            time_el = node.select_one(source["time_selector"])
+            if time_el:
+                published_dt = try_parse_time(time_el.get_text(strip=True))
+
+        if title and link:
+            items.append({
+                "title": title,
+                "link": link,
+                "published": published_dt,
+                "source": source["name"],
+            })
+    return items
+
+
+def fetch_html(source):
     items = []
     html_content, method_used = _fetch_page_html(source["list_url"])
     if html_content is None:
@@ -254,38 +310,46 @@ def fetch_html(source):
     print(f"[INFO] {source['name']} 以「{method_used}」方式成功取得頁面", file=sys.stderr)
 
     try:
-        soup = BeautifulSoup(html_content, "html.parser")
-        nodes = soup.select(source["item_selector"])
-        for node in nodes:
-            title_el = node.select_one(source["title_selector"])
-            link_el = node.select_one(source["link_selector"])
-            if not title_el or not link_el:
-                continue
-            title = title_el.get_text(strip=True)
-            link = link_el.get("href", "").strip()
-            if link and not link.startswith("http"):
-                link = urljoin(source["list_url"], link)
-
-            published_dt = None
-            if source.get("time_selector"):
-                time_el = node.select_one(source["time_selector"])
-                if time_el:
-                    published_dt = try_parse_time(time_el.get_text(strip=True))
-
-            if title and link:
-                items.append({
-                    "title": title,
-                    "link": link,
-                    "published": published_dt,
-                    "source": source["name"],
-                })
+        if source.get("parser") == "yuenan":
+            items, soup = parse_yuenan_listing(html_content, source["list_url"], source["name"])
+        else:
+            soup = BeautifulSoup(html_content, "html.parser")
+            items = parse_generic_listing(soup, source)
     except Exception as e:
         print(f"[WARN] HTML 解析失敗 ({source['name']}): {e}", file=sys.stderr)
+        return items
+
+    if len(items) == 0:
+        print(
+            f"[WARN] {source['name']} 頁面成功取得，但解析到 0 筆，"
+            f"可能是網頁結構與目前的解析邏輯不符。",
+            file=sys.stderr,
+        )
+        _debug_dump_html_snippet(source["name"], soup)
+
     return items
 
 
+def _debug_dump_html_snippet(source_name, soup):
+    print(f"[DEBUG] ===== {source_name} 頁面結構除錯資訊開始 =====", file=sys.stderr)
+
+    candidate_links = [a for a in soup.find_all("a") if a.get_text(strip=True) and len(a.get_text(strip=True)) > 8]
+    print(f"[DEBUG] 頁面中共找到 {len(soup.find_all('a'))} 個 <a> 標籤，"
+          f"其中文字長度 > 8 的有 {len(candidate_links)} 個，列出前 15 個：", file=sys.stderr)
+
+    for a in candidate_links[:15]:
+        parent = a.parent
+        grandparent = parent.parent if parent else None
+        parent_desc = f"<{parent.name} class='{' '.join(parent.get('class', []))}'>" if parent else "無"
+        grandparent_desc = f"<{grandparent.name} class='{' '.join(grandparent.get('class', []))}'>" if grandparent else "無"
+        href = a.get("href", "")
+        text = a.get_text(strip=True)[:40]
+        print(f"[DEBUG]   文字: 「{text}」 | href: {href[:60]} | 父層: {parent_desc} | 祖父層: {grandparent_desc}", file=sys.stderr)
+
+    print(f"[DEBUG] ===== {source_name} 頁面結構除錯資訊結束 =====", file=sys.stderr)
+
+
 def try_parse_time(text):
-    """嘗試解析常見中文/數字時間格式，失敗回傳 None。"""
     from dateutil import parser as dateparser
     try:
         dt = dateparser.parse(text, fuzzy=True)
@@ -300,18 +364,23 @@ def try_parse_time(text):
 
 def collect_all_items():
     all_items = []
+    source_counts = []
     for source in SOURCES + google_news_rss_sources():
         if source["type"] == "rss":
-            all_items.extend(fetch_rss(source))
+            fetched = fetch_rss(source)
         else:
-            all_items.extend(fetch_html(source))
-        time.sleep(1)  # 禮貌性間隔，避免對來源網站造成負擔
+            fetched = fetch_html(source)
+        source_counts.append((source["name"], len(fetched)))
+        all_items.extend(fetched)
+        time.sleep(1)
+
+    print("[INFO] ===== 各來源抓取筆數 =====", file=sys.stderr)
+    for name, count in source_counts:
+        print(f"[INFO]   {name}: {count} 筆", file=sys.stderr)
+    print("[INFO] ===========================", file=sys.stderr)
+
     return all_items
 
-
-# ---------------------------------------------------------------------------
-# 時間篩選：越南時間前一日 07:00:00 ~ 當日 06:59:59
-# ---------------------------------------------------------------------------
 
 def get_time_window(now_vn):
     end = now_vn.replace(hour=6, minute=59, second=59, microsecond=0)
@@ -328,17 +397,12 @@ def filter_by_time(items, start, end):
     for item in items:
         pub = item.get("published")
         if pub is None:
-            # 抓不到精確發布時間的來源，先保留讓 Gemini 依內容判斷是否為近期新聞。
             filtered.append(item)
             continue
         if start <= pub <= end:
             filtered.append(item)
     return filtered
 
-
-# ---------------------------------------------------------------------------
-# 去重（第一階段：網址去重）
-# ---------------------------------------------------------------------------
 
 def dedupe_by_url(items):
     seen = set()
@@ -351,12 +415,6 @@ def dedupe_by_url(items):
         result.append(item)
     return result
 
-
-# ---------------------------------------------------------------------------
-# 去重（第二階段：Gemini 語意去重）
-# 多個來源（原始網站 + Google News 轉載 + 不同媒體報導同一事件）常出現
-# 標題文字不同、但描述同一則新聞的情況，用語意判斷合併只保留一則。
-# ---------------------------------------------------------------------------
 
 def _clean_json_block(text):
     return re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
@@ -385,9 +443,6 @@ def build_dedupe_prompt(items):
 
 
 def semantic_dedupe(items, api_key):
-    """用 Gemini 對整批新聞做語意去重，回傳去重後的清單。
-    若 API 呼叫失敗，為避免整批資料流失，退回直接使用網址去重的結果。
-    """
     if len(items) <= 1:
         return items
 
@@ -411,8 +466,6 @@ def semantic_dedupe(items, api_key):
         valid_indices = sorted({i - 1 for i in group if isinstance(i, int) and 1 <= i <= len(items)})
         if len(valid_indices) < 2:
             continue
-        # 保留規則：優先保留「非 Google News 轉載」的原始出處；
-        # 若組內都是轉載或都非轉載，則保留清單中最先出現的一筆。
         keep_idx = None
         for idx in valid_indices:
             if "Google News 轉載" not in items[idx]["source"]:
@@ -428,10 +481,6 @@ def semantic_dedupe(items, api_key):
     print(f"[INFO] 語意去重：{len(items)} 筆 → {len(deduped)} 筆（移除 {len(to_remove)} 筆重複報導）")
     return deduped
 
-
-# ---------------------------------------------------------------------------
-# Gemini API：批次翻譯 + 分類
-# ---------------------------------------------------------------------------
 
 CATEGORY_RULES = """
 【01 政治】越南黨政高層動態（國家主席蘇林、總理黎明興、國會主席陳青敏、外交部長黎懷中、
@@ -474,7 +523,6 @@ def build_classify_prompt(batch):
 
 
 def call_gemini_classify_batch(batch, api_key):
-    """呼叫 Gemini API 進行批次翻譯與分類，回傳 dict: index -> {title_zh, category}"""
     from google import genai
 
     client = genai.Client(api_key=api_key)
@@ -500,7 +548,6 @@ def call_gemini_classify_batch(batch, api_key):
 
 
 def classify_and_translate(items, api_key, batch_size=15):
-    """將 items 分批送入 Gemini，回傳篩選/翻譯/分類後的新聞清單。"""
     output = []
     for i in range(0, len(items), batch_size):
         batch = items[i:i + batch_size]
@@ -518,13 +565,9 @@ def classify_and_translate(items, api_key, batch_size=15):
                 "category": info["category"],
                 "published": item["published"].isoformat() if item.get("published") else None,
             })
-        time.sleep(1)  # 批次間稍作停頓，降低 API 速率限制風險
+        time.sleep(1)
     return output
 
-
-# ---------------------------------------------------------------------------
-# 輸出
-# ---------------------------------------------------------------------------
 
 def write_daily_json(target_date: date, news_items, generated_at_vn):
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -577,10 +620,6 @@ def update_index(target_date: date):
 
     print(f"[INFO] 已更新 index.json，目前共 {len(dates)} 個日期，最新日期：{dates[-1]}")
 
-
-# ---------------------------------------------------------------------------
-# 主流程
-# ---------------------------------------------------------------------------
 
 def main():
     api_key = os.environ.get("GEMINI_API_KEY")

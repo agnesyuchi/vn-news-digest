@@ -1,10 +1,11 @@
 name: Daily Vietnam/Laos News Digest
 
 on:
-  schedule:
-    # UTC 23:50（前一日）= 越南時間 06:50 = 台灣時間 07:50
-    - cron: "50 23 * * *"
-  workflow_dispatch: {}   # 允許在 GitHub 網頁上手動點擊執行（方便測試）
+  # 原本這裡有 GitHub 自己的 schedule 排程（cron），但因排程觸發時間不穩定
+  # （曾實測延遲近 4 小時才觸發），改由外部的 Google Apps Script 定時呼叫
+  # GitHub API 觸發 workflow_dispatch，作為唯一的每日觸發來源，避免與
+  # GitHub 內建排程重複觸發、多消耗 Gemini API 額度。
+  workflow_dispatch: {}   # 允許手動點擊執行、或由外部 API 呼叫觸發（Apps Script 使用此方式）
 
 permissions:
   contents: write   # 需要允許 workflow 將產生的 JSON 檔 commit 回 repo

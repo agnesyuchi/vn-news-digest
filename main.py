@@ -164,7 +164,7 @@ def _extract_google_news_origin(entry, fallback_title):
 
 
 def fetch_rss(source):
-    """解析 RSS/Atom feed，回傳 [{title, link, published, source}, ...]"""
+    """解析 RSS/Atom feed，回傳 [{title, link, published, source, excerpt}, ...]"""
     items = []
     try:
         feed = feedparser.parse(source["feed_url"])
@@ -177,6 +177,15 @@ def fetch_rss(source):
                 if tstruct:
                     published_dt = datetime(*tstruct[:6], tzinfo=pytz.UTC).astimezone(VN_TZ)
                     break
+
+            # 摘要片段（若 RSS 有提供）：用於後續最終去重步驟做「內容層級」的比對，
+            # 而不是只比對標題文字。Google News 轉載的摘要欄位有時只是重複標題，
+            # 價值有限，但保留下來仍無害，且直接來源的 RSS（如 VietnamPlus）
+            # 通常會有較完整的摘要內容。
+            raw_summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
+            excerpt = ""
+            if raw_summary:
+                excerpt = BeautifulSoup(raw_summary, "html.parser").get_text(strip=True)[:150]
 
             source_name = source["name"]
             title = raw_title
@@ -199,6 +208,7 @@ def fetch_rss(source):
                     "link": link,
                     "published": published_dt,
                     "source": source_name,
+                    "excerpt": excerpt,
                 })
     except Exception as e:
         print(f"[WARN] RSS 抓取失敗 ({source['name']}): {e}", file=sys.stderr)
@@ -375,11 +385,19 @@ def parse_yuenan_listing(html, base_url, source_name):
             published_dt = _parse_relative_chinese_time(date_text, reference_dt)
             within_24h_candidate = _is_within_roughly_24h(date_text)
 
+        # 摘要片段（若有）：用於後續最終去重步驟做「內容層級」的比對，
+        # 而不是只比對標題文字，能抓到標題寫法差異大、但實際內容重疊的狀況。
+        excerpt = ""
+        excerpt_el = item_content.select_one(".item-excerpt")
+        if excerpt_el:
+            excerpt = excerpt_el.get_text(strip=True)[:150]
+
         items.append({
             "title": title,
             "link": link,
             "published": published_dt,
             "source": source_name,
+            "excerpt": excerpt,
             "_within_24h_candidate": within_24h_candidate,
         })
 
@@ -1024,6 +1042,7 @@ def classify_and_translate_batches(items, api_key):
                 "source": item["source"],
                 "category": category,
                 "published": item["published"].isoformat() if item.get("published") else None,
+                "excerpt": item.get("excerpt", ""),
             })
 
     return output
@@ -1049,57 +1068,107 @@ def _is_cna_source(source_name):
     return "中央通訊社" in source_name or "cna" in source_name.lower()
 
 
+# 每日新聞摘要的總篇數上限（三個類別加總）。新聞量會隨時間增加，
+# 為避免版面過於冗長、稀釋真正重要新聞的能見度，去重之後會依重要性
+# 排序只保留最重要的前 N 則。此上限不強制三個類別平均分配名額，
+# 而是依當日實際重要性分佈決定——如果需要保障每個類別都至少有
+# 一定篇數，可另外調整 finalize_daily_selection() 的篩選邏輯。
+MAX_DAILY_ARTICLES = 15
+
+
 def build_final_dedupe_prompt(items):
-    numbered = "\n".join(
-        f'{i+1}. 「{it["title"]}」（來源：{it["source"]}；發布時間：'
-        f'{it["published"] if it.get("published") else "未知"}）'
-        for i, it in enumerate(items)
-    )
-    return f"""以下是今天已完成翻譯與分類的新聞清單，其中可能包含重複內容，包含兩種情況都算重複：
-(a) 描述同一則具體新聞事件，只是不同媒體轉載或標題用詞不同；
+    numbered_lines = []
+    for i, it in enumerate(items):
+        excerpt = (it.get("excerpt") or "").strip()
+        excerpt_part = f"；摘要：{excerpt}" if excerpt else ""
+        numbered_lines.append(
+            f'{i+1}. 「{it["title"]}」（來源：{it["source"]}；發布時間：'
+            f'{it["published"] if it.get("published") else "未知"}{excerpt_part}）'
+        )
+    numbered = "\n".join(numbered_lines)
+
+    return f"""以下是今天已完成翻譯與分類的新聞清單，請完成兩項任務。
+
+【任務一：去重】判斷依據請同時參考「標題」與「摘要」兩者，不要只看標題文字是否相似——
+有些新聞標題寫法差異很大，但摘要內容其實描述同一件事；也有標題看起來相近，但摘要顯示
+其實是不同事件，請以「內容實質是否重疊」為準，而非單純比對標題用詞。
+找出所有重複內容，包含兩種情況都算重複：
+(a) 描述同一則具體新聞事件，只是不同媒體轉載、標題用詞不同、或摘要細節詳略有異；
 (b) 描述「同一個持續性主題或系列進展」，核心議題高度重疊，僅報導角度、細節或
     統計數字略有不同（例如同一機場的無人機／風箏干擾問題被多次以不同標題報導、
     同一事件的後續追蹤報導）。
 若是各自獨立、具有不同具體資訊的個別事件（例如不同地點、不同日期發生的不同意外），
 則不算重複，應個別保留，不要過度合併。不確定是否重複時，不要視為重複（寧可漏判，不要誤判）。
 
-請找出所有重複項目並將編號分組。
+【任務二：重要性排序】針對清單中「所有」項目（不用先排除任務一判定的重複項目，
+排序中一併包含即可，去重會在後續處理），依照對台灣、越南、寮國外交人員的
+參考價值，由「最重要」到「最不重要」排出完整順序。判斷標準（依優先順序由高到低）：
+1. 直接涉及台灣的事件（台越／台寮雙邊關係、對台灣的官方或非官方言論、涉及
+   台灣人的重大事件）優先於與台灣無直接關聯的事件。
+2. 東南亞跨國詐騙、人口販運相關新聞（即使該則新聞未明確點名台灣人受害，
+   仍屬高度優先議題）。
+3. 國家元首、總理、外交部長等最高層級官員的直接行動或決策，優先於較低層級
+   官員的活動、或僅止於評論分析性質的報導。
+4. 已簽署生效的協議、政策、法規，優先於仍在倡議、研議、規劃階段的消息。
+5. 影響範圍為全國性、國際性的事件，優先於地方性、單一機構層級的事件。
+若一則新聞同時符合多項標準（例如「涉及台灣人的跨國詐騙案件」同時符合第 1 與
+第 2 項），應排在更前面。
 
 新聞清單：
 {numbered}
 
 請「只」回傳一個 JSON 物件，不要加入任何說明文字或 Markdown 語法，格式如下：
-{{"duplicate_groups": [[編號, 編號, ...], [編號, 編號, ...]]}}
-只需列出「有重複」的分組（每組至少 2 個編號），沒有重複的項目不必列出。
-若完全沒有重複項目，回傳 {{"duplicate_groups": []}}。
+{{"duplicate_groups": [[編號, 編號, ...], [編號, 編號, ...]], "importance_ranking": [編號, 編號, ...]}}
+- duplicate_groups：只需列出「有重複」的分組（每組至少 2 個編號），沒有重複則回傳空陣列 []。
+- importance_ranking：「必須」包含清單中每一個編號恰好一次，依重要性由高到低完整排序。
 """
 
 
-def final_dedupe(items, api_key):
-    """對翻譯分類後的完整名單做單一次全域去重。
-    找出重複分組後，保留規則由程式碼直接判斷（而非完全交給 Gemini 排序），
+def finalize_daily_selection(items, api_key):
+    """對翻譯分類後的完整名單做單一次全域去重，並依重要性排序後
+    只保留前 MAX_DAILY_ARTICLES 則，避免新聞量過多時版面過於冗長。
+
+    去重的保留規則由程式碼直接判斷（而非完全交給 Gemini 排序），
     確保優先順序被精確套用，優先順序如下（由高到低）：
     (1) 中央通訊社（CNA）來源；(2) 發布時間最新；(3) 非 Google News 轉載的
     原始出處；(4) 編號最小者。
-    若 API 呼叫失敗，為避免整批資料流失，直接回傳原始清單（不去重但保留全部資料）。
+
+    重要性排序則交由 Gemini 依 prompt 中列出的判斷標準完整排序，
+    程式碼只負責依排序結果截取前 N 名，不自行判斷重要性。
+
+    若 API 呼叫失敗或回傳內容無法解析，為避免整批資料流失，退回使用
+    原始清單順序，僅做「截取前 N 則」的基本保護，不去重、不依重要性排序。
     """
-    if len(items) <= 1:
+    if not items:
         return items
+
+    if len(items) <= 1:
+        return items[:MAX_DAILY_ARTICLES]
 
     prompt = build_final_dedupe_prompt(items)
     raw_text = _call_gemini_with_retry(prompt, api_key)
 
     if raw_text is None:
-        print("[WARN] 最終去重呼叫失敗，本次略過去重（新聞可能包含重複項目）", file=sys.stderr)
-        return items
+        print(
+            f"[WARN] 最終去重＋重要性排序呼叫失敗，退回原始順序並僅截取前 "
+            f"{MAX_DAILY_ARTICLES} 則（未去重、未依重要性排序）",
+            file=sys.stderr,
+        )
+        return items[:MAX_DAILY_ARTICLES]
 
     try:
         parsed = json.loads(_clean_json_block(raw_text))
         groups = parsed.get("duplicate_groups", [])
+        importance_ranking = parsed.get("importance_ranking", [])
     except Exception as e:
-        print(f"[WARN] 最終去重回傳內容解析失敗，本次略過去重: {e}", file=sys.stderr)
-        return items
+        print(
+            f"[WARN] 最終去重＋重要性排序回傳內容解析失敗，退回原始順序並僅截取前 "
+            f"{MAX_DAILY_ARTICLES} 則: {e}",
+            file=sys.stderr,
+        )
+        return items[:MAX_DAILY_ARTICLES]
 
+    # ---- 第一步：去重（邏輯與先前版本相同）----
     to_remove = set()
     for group in groups:
         valid_indices = sorted({i - 1 for i in group if isinstance(i, int) and 1 <= i <= len(items)})
@@ -1136,9 +1205,34 @@ def final_dedupe(items, api_key):
             if idx != keep_idx:
                 to_remove.add(idx)
 
-    deduped = [item for i, item in enumerate(items) if i not in to_remove]
-    print(f"[INFO] 最終全域去重：{len(items)} 筆 → {len(deduped)} 筆（移除 {len(to_remove)} 筆重複報導）")
-    return deduped
+    deduped_count = len(items) - len(to_remove)
+
+    # ---- 第二步：依重要性排序，只保留去重後存活的項目，再截取前 N 名 ----
+    ordered_indices = []
+    seen = set()
+    for i in importance_ranking:
+        if not isinstance(i, int):
+            continue
+        idx = i - 1
+        if 0 <= idx < len(items) and idx not in to_remove and idx not in seen:
+            ordered_indices.append(idx)
+            seen.add(idx)
+
+    # 保險機制：若 Gemini 回傳的排序清單有缺漏（例如漏了某些編號），
+    # 把剩餘存活但未被排序到的項目依原始順序補在後面，確保不會憑空遺失資料。
+    for idx in range(len(items)):
+        if idx not in to_remove and idx not in seen:
+            ordered_indices.append(idx)
+            seen.add(idx)
+
+    final_indices = ordered_indices[:MAX_DAILY_ARTICLES]
+    final_items = [items[idx] for idx in final_indices]
+
+    print(
+        f"[INFO] 最終去重＋精選：{len(items)} 筆 → 去重後 {deduped_count} 筆 → "
+        f"依重要性精選 {len(final_items)} 筆（上限 {MAX_DAILY_ARTICLES}）"
+    )
+    return final_items
 
 
 # ---------------------------------------------------------------------------
@@ -1231,7 +1325,7 @@ def main():
     classified = classify_and_translate_batches(url_deduped, api_key)
     print(f"[INFO] Gemini 翻譯＋分類後保留筆數: {len(classified)}")
 
-    final_items = final_dedupe(classified, api_key)
+    final_items = finalize_daily_selection(classified, api_key)
 
     write_daily_json(target_date, final_items, now_vn)
     update_index(target_date)

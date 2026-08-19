@@ -1,0 +1,46 @@
+name: Daily Vietnam/Laos News Digest
+
+on:
+  # 僅保留 workflow_dispatch，由外部的 Google Apps Script 定時呼叫 GitHub API
+  # 觸發，作為唯一的每日觸發來源。此檔案為刪除後重新建立的全新版本，
+  # 目的是徹底清除 GitHub 排程系統中殘留的舊版 cron 登記記錄。
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 簽出 repo 原始碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 安裝 Playwright 瀏覽器（用於繞過防爬蟲網站）
+        run: playwright install --with-deps chromium
+
+      - name: 執行爬蟲與 Gemini 分類翻譯
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python main.py
+
+      - name: 將新資料 commit 回 repo
+        run: |
+          git config user.name "news-digest-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "沒有新資料變動，略過 commit"
+          else
+            git commit -m "chore: update daily news digest ($(date -u +'%Y-%m-%d'))"
+            git push
+          fi

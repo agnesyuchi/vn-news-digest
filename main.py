@@ -1068,12 +1068,23 @@ def _is_cna_source(source_name):
     return "中央通訊社" in source_name or "cna" in source_name.lower()
 
 
-# 每日新聞摘要的總篇數上限（三個類別加總）。新聞量會隨時間增加，
-# 為避免版面過於冗長、稀釋真正重要新聞的能見度，去重之後會依重要性
-# 排序只保留最重要的前 N 則。此上限不強制三個類別平均分配名額，
-# 而是依當日實際重要性分佈決定——如果需要保障每個類別都至少有
-# 一定篇數，可另外調整 finalize_daily_selection() 的篩選邏輯。
-MAX_DAILY_ARTICLES = 15
+# 每日新聞摘要的總篇數「上限」（三個類別加總）——這是上限，不是目標值。
+# 分類階段本來就只會保留真正符合外交參考價值的新聞，這裡的上限只在新聞量
+# 異常多時才會實際發揮截斷作用；新聞量正常的日子，只要真正合格的新聞不到
+# 這個數字，就只會顯示實際數量，不會為了湊滿而放寬標準。
+# 此上限不強制三個類別平均分配名額，而是依當日實際重要性分佈決定。
+MAX_DAILY_ARTICLES = 25
+
+# 分組去重機制的相關設定：當「翻譯分類後存活」的新聞筆數超過 GROUP_SIZE 時，
+# 代表當天新聞量異常多，若直接把全部項目塞進單一次去重＋排序呼叫，
+# 項目數過多容易讓 Gemini 的兩兩比對與排序品質下降（跟先前把分類批次從
+# 300 調降到 50 是同樣的考量）。此時改採分組處理：
+#   1. 先切成每組 ≤ GROUP_SIZE 筆的小組，各組分別去重＋排序；
+#   2. 各組依重要性取出份額，合併成一份 ≤ COMBINE_POOL_CAP 筆的候選池；
+#   3. 對候選池做最終一次去重＋排序，選出前 MAX_DAILY_ARTICLES 則。
+# 新聞量正常的日子（≤ GROUP_SIZE）完全不會觸發分組，維持原本單次呼叫的效率。
+GROUP_SIZE = 40
+COMBINE_POOL_CAP = 30
 
 
 def build_final_dedupe_prompt(items):
@@ -1124,9 +1135,11 @@ def build_final_dedupe_prompt(items):
 """
 
 
-def finalize_daily_selection(items, api_key):
-    """對翻譯分類後的完整名單做單一次全域去重，並依重要性排序後
-    只保留前 MAX_DAILY_ARTICLES 則，避免新聞量過多時版面過於冗長。
+def _dedupe_rank_and_trim(items, api_key, cap, label="去重＋精選"):
+    """核心邏輯：對一份新聞清單做「單一次」去重＋重要性排序，並截取前 cap 名。
+    這是 finalize_daily_selection() 底層共用的核心單元——不管是新聞量正常時的
+    單次處理、或新聞量暴增時分組處理的「每一組」與「最終合併池」，都呼叫
+    這同一個函式，確保去重規則與排序邏輯全程一致，不會有兩套標準。
 
     去重的保留規則由程式碼直接判斷（而非完全交給 Gemini 排序），
     確保優先順序被精確套用，優先順序如下（由高到低）：
@@ -1134,27 +1147,27 @@ def finalize_daily_selection(items, api_key):
     原始出處；(4) 編號最小者。
 
     重要性排序則交由 Gemini 依 prompt 中列出的判斷標準完整排序，
-    程式碼只負責依排序結果截取前 N 名，不自行判斷重要性。
+    程式碼只負責依排序結果截取前 cap 名，不自行判斷重要性。
 
     若 API 呼叫失敗或回傳內容無法解析，為避免整批資料流失，退回使用
-    原始清單順序，僅做「截取前 N 則」的基本保護，不去重、不依重要性排序。
+    原始清單順序，僅做「截取前 cap 則」的基本保護，不去重、不依重要性排序。
     """
     if not items:
         return items
 
     if len(items) <= 1:
-        return items[:MAX_DAILY_ARTICLES]
+        return items[:cap]
 
     prompt = build_final_dedupe_prompt(items)
     raw_text = _call_gemini_with_retry(prompt, api_key)
 
     if raw_text is None:
         print(
-            f"[WARN] 最終去重＋重要性排序呼叫失敗，退回原始順序並僅截取前 "
-            f"{MAX_DAILY_ARTICLES} 則（未去重、未依重要性排序）",
+            f"[WARN] {label}呼叫失敗，退回原始順序並僅截取前 {cap} 則"
+            f"（未去重、未依重要性排序）",
             file=sys.stderr,
         )
-        return items[:MAX_DAILY_ARTICLES]
+        return items[:cap]
 
     try:
         parsed = json.loads(_clean_json_block(raw_text))
@@ -1162,13 +1175,12 @@ def finalize_daily_selection(items, api_key):
         importance_ranking = parsed.get("importance_ranking", [])
     except Exception as e:
         print(
-            f"[WARN] 最終去重＋重要性排序回傳內容解析失敗，退回原始順序並僅截取前 "
-            f"{MAX_DAILY_ARTICLES} 則: {e}",
+            f"[WARN] {label}回傳內容解析失敗，退回原始順序並僅截取前 {cap} 則: {e}",
             file=sys.stderr,
         )
-        return items[:MAX_DAILY_ARTICLES]
+        return items[:cap]
 
-    # ---- 第一步：去重（邏輯與先前版本相同）----
+    # ---- 第一步：去重 ----
     to_remove = set()
     for group in groups:
         valid_indices = sorted({i - 1 for i in group if isinstance(i, int) and 1 <= i <= len(items)})
@@ -1207,7 +1219,7 @@ def finalize_daily_selection(items, api_key):
 
     deduped_count = len(items) - len(to_remove)
 
-    # ---- 第二步：依重要性排序，只保留去重後存活的項目，再截取前 N 名 ----
+    # ---- 第二步：依重要性排序，只保留去重後存活的項目，再截取前 cap 名 ----
     ordered_indices = []
     seen = set()
     for i in importance_ranking:
@@ -1225,14 +1237,66 @@ def finalize_daily_selection(items, api_key):
             ordered_indices.append(idx)
             seen.add(idx)
 
-    final_indices = ordered_indices[:MAX_DAILY_ARTICLES]
+    final_indices = ordered_indices[:cap]
     final_items = [items[idx] for idx in final_indices]
 
     print(
-        f"[INFO] 最終去重＋精選：{len(items)} 筆 → 去重後 {deduped_count} 筆 → "
-        f"依重要性精選 {len(final_items)} 筆（上限 {MAX_DAILY_ARTICLES}）"
+        f"[INFO] {label}：{len(items)} 筆 → 去重後 {deduped_count} 筆 → "
+        f"精選 {len(final_items)} 筆（上限 {cap}）"
     )
     return final_items
+
+
+def finalize_daily_selection(items, api_key):
+    """對翻譯分類後的完整名單做去重＋重要性排序，只保留最重要的前
+    MAX_DAILY_ARTICLES 則，避免新聞量過多時版面過於冗長。
+
+    新聞量正常時（≤ GROUP_SIZE 筆），直接單一次呼叫處理，維持效率。
+
+    新聞量異常多時（> GROUP_SIZE 筆），改採分組處理以維持判斷品質：
+      1. 切成每組 ≤ GROUP_SIZE 筆的小組，各組分別去重＋排序；
+      2. 各組依重要性取出份額（依組數平均分配，確保合併池不超過
+         COMBINE_POOL_CAP），合併成一份候選池；
+      3. 對候選池做最終一次去重＋排序（可再抓出「跨組」的重複項目），
+         選出重要性最高的前 MAX_DAILY_ARTICLES 則。
+    """
+    if not items:
+        return items
+
+    if len(items) <= GROUP_SIZE:
+        return _dedupe_rank_and_trim(items, api_key, cap=MAX_DAILY_ARTICLES, label="最終去重＋精選")
+
+    # ---- 新聞量異常多，啟動分組處理 ----
+    print(
+        f"[INFO] 存活新聞筆數（{len(items)}）超過分組門檻（{GROUP_SIZE}），"
+        f"啟動分組去重機制",
+        file=sys.stderr,
+    )
+
+    groups = [items[i:i + GROUP_SIZE] for i in range(0, len(items), GROUP_SIZE)]
+    num_groups = len(groups)
+    # 依組數平均分配，確保合併後的候選池不超過 COMBINE_POOL_CAP。
+    per_group_cap = max(1, -(-COMBINE_POOL_CAP // num_groups))  # 無條件進位
+
+    combined_pool = []
+    for group_idx, group in enumerate(groups, start=1):
+        group_result = _dedupe_rank_and_trim(
+            group, api_key, cap=per_group_cap,
+            label=f"第 {group_idx}/{num_groups} 組去重＋精選",
+        )
+        combined_pool.extend(group_result)
+
+    # 保險截斷：per_group_cap 是無條件進位計算，各組加總可能略超過 COMBINE_POOL_CAP。
+    if len(combined_pool) > COMBINE_POOL_CAP:
+        combined_pool = combined_pool[:COMBINE_POOL_CAP]
+
+    print(
+        f"[INFO] 各組精選完成，合併候選池共 {len(combined_pool)} 筆"
+        f"（上限 {COMBINE_POOL_CAP}），進入最終去重＋排序",
+        file=sys.stderr,
+    )
+
+    return _dedupe_rank_and_trim(combined_pool, api_key, cap=MAX_DAILY_ARTICLES, label="最終去重＋精選")
 
 
 # ---------------------------------------------------------------------------
